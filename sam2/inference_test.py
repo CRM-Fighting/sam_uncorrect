@@ -29,7 +29,12 @@ def preprocess_image(image_path, device):
 
     # 4. 转为 Tensor: (H, W, C) -> (C, H, W) -> (1, C, H, W)
     img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)
-
+    """
+    from_numpy: 变成 PyTorch 的 Tensor（张量）。
+    permute(2, 0, 1): 这步很重要！ PyTorch 要求的顺序是 (通道, 高, 宽)，所以把 3 放到最前面。形状变了：(3, 480, 640)。
+    unsqueeze(0): 增加一个“包装盒”维度（Batch Size）。因为神经网络一次可以处理多张图，这里只有1张，所以加个1。
+    最终数据形状：[1, 3, 480, 640]。这就像一个包裹，里面装着数据。
+    """
     return img_tensor.to(device), img_np
 
 
