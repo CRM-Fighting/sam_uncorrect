@@ -19,14 +19,13 @@ from sam2.modeling.multimodal_sam_global_aoe import MultiModalSegFormerGlobalAoE
 
 # ================= 实验参数 =================
 # Model: Shared Global Guided AoE (Ours)
-# Experts: 8
-# Active: 3 (+1 Shared)
+# Experts: 8, Active: 3
 # Aux Weight: 0.5
-# Optimization: AMP + Batch=1 + Accumulation=2
+# LR: Backbone 1e-4, Router 1e-3 (10x)
 # ==========================================
 
 AUX_WEIGHT = 0.5
-EXP_NAME = "Exp_GlobalAoE_Shared_Aux0.5"
+EXP_NAME = "Exp_GlobalAoE_Shared_Aux0.5_HighLR"  # 标记一下高学习率
 
 # 路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,9 +46,6 @@ VAL_DIRS = {
     'label': r"/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/test/Segmentation_labels"
 }
 
-
-# ... (请直接从 train_exp_AoE.py 复制 IOUEvaluator, SegmentationLoss, MSRSDataset, plot_training_curves) ...
-# 为了确保你能跑，我再贴一次辅助类，防止你复制漏了
 
 class IOUEvaluator:
     def __init__(self, num_classes):
@@ -148,8 +144,7 @@ def train_global_aoe():
     os.makedirs(VIS_DIR, exist_ok=True)
 
     print(f"=== Running Experiment: {EXP_NAME} (Ours) ===")
-    print(f"=== Config: Shared Expert + Global Guided AoE ===")
-    print(f"=== Optimization: AMP + Gradient Accumulation ===")
+    print(f"=== Config: Shared + Global Guided (Diff LR) ===")
 
     # 1. 构建
     base_sam = build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device="cpu")
@@ -169,14 +164,29 @@ def train_global_aoe():
 
     model.to(device)
 
-    # 3. 统计参数
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    print(f"Trainable Params: {sum(p.numel() for p in trainable) / 1e6:.2f} M")
+    # 3. 统计参数 & 【关键修改】差分学习率
+    router_params = []
+    other_params = []
 
-    optimizer = optim.AdamW(trainable, lr=0.0001)
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 识别 Router 相关的参数 (router, gate, scorer, w_down, w_up, expert_pos)
+        if "moe" in name:
+            router_params.append(param)
+        else:
+            other_params.append(param)
+
+    print(f"Router Params (High LR 1e-3): {sum(p.numel() for p in router_params) / 1e6:.2f} M")
+    print(f"Other Params (Base LR 1e-4): {sum(p.numel() for p in other_params) / 1e6:.2f} M")
+
+    optimizer = optim.AdamW([
+        {'params': other_params, 'lr': 0.0001},
+        {'params': router_params, 'lr': 0.001}  # 10倍学习率
+    ])
+
     criterion = SegmentationLoss(num_classes=9)
     evaluator = IOUEvaluator(num_classes=9)
-    # AMP Scaler
     scaler = GradScaler()
 
     history = {'train_loss': [], 'val_loss': [], 'train_miou': [], 'val_miou': [], 'train_aux': []}
@@ -191,7 +201,7 @@ def train_global_aoe():
         aux_meter = 0
         evaluator.reset()
 
-        # Batch Size = 1
+        # Batch=1, Accum=2 (Equivalent to Batch=2)
         train_loader = DataLoader(MSRSDataset(TRAIN_DIRS), batch_size=1, shuffle=True, num_workers=4)
         optimizer.zero_grad()
 
@@ -215,14 +225,8 @@ def train_global_aoe():
             train_loss_meter += current_loss
             aux_meter += aux_loss.item()
 
-            # Train mIoU (可选，如果卡顿可注释掉)
-            # pred_mask = torch.argmax(preds, dim=1)
-            # evaluator.add_batch(label.cpu().numpy(), pred_mask.cpu().numpy())
-
             pbar.set_postfix({"Loss": f"{current_loss:.3f}", "Aux": f"{aux_loss.item():.3f}"})
 
-        # train_miou, _ = evaluator.get_metrics()
-        # history['train_miou'].append(train_miou)
         history['train_loss'].append(train_loss_meter / len(train_loader))
         history['train_aux'].append(aux_meter / len(train_loader))
 
@@ -233,11 +237,9 @@ def train_global_aoe():
         with torch.no_grad():
             for vis, ir, label in tqdm(DataLoader(MSRSDataset(VAL_DIRS, limit=100), batch_size=2, num_workers=2)):
                 vis, ir, label = vis.to(device), ir.to(device), label.to(device)
-
                 with autocast():
                     preds, _ = model(vis, ir)
                     loss = criterion(preds, label)
-
                 val_loss_meter += loss.item()
                 evaluator.add_batch(label.cpu().numpy(), torch.argmax(preds, dim=1).cpu().numpy())
 

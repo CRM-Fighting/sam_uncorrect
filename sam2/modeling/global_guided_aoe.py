@@ -21,7 +21,8 @@ class ExpertLayer(nn.Module):
 
 class GlobalGuidedAoERouter(nn.Module):
     """
-    【论文创新点】Global Guided AoE Router
+    【最终修正版】Global Guided AoE Router
+    包含防塌陷机制：Tanh限制 + 强噪声
     """
 
     def __init__(self, d_model, num_experts, d_low, topk=3, dropout=0.1):
@@ -35,7 +36,7 @@ class GlobalGuidedAoERouter(nn.Module):
         self.w_down = nn.Linear(d_model, num_experts * d_low, bias=False)
 
         # 2. 交互感知模块
-        # 【关键修复】维度改为 3D: [1, N, d_low]，不再是 4D [1, 1, N, d_low]
+        # 【关键修复】维度改为 3D: [1, N, d_low]，确保与 B*T (3D) 兼容
         self.expert_pos_embed = nn.Parameter(torch.randn(1, num_experts, d_low))
         self.global_proj = nn.Linear(d_model, d_low)
 
@@ -44,8 +45,9 @@ class GlobalGuidedAoERouter(nn.Module):
         )
         self.norm = nn.LayerNorm(d_low)
 
-        # 3. 双路门控
+        # 3. 双路门控 (Dual-Path Gating)
         self.local_scorer = nn.Linear(d_low, 1)
+
         self.global_gate_mlp = nn.Sequential(
             nn.Linear(d_low, d_low * 2),
             nn.GELU(),
@@ -62,6 +64,7 @@ class GlobalGuidedAoERouter(nn.Module):
         nn.init.normal_(self.w_down.weight, std=0.02)
         nn.init.normal_(self.expert_pos_embed, std=0.02)
         nn.init.normal_(self.w_up, std=0.02)
+        nn.init.normal_(self.local_scorer.weight, std=0.02)
 
     def _sparse_w_up(self, feats, indices):
         selected_w_up = self.w_up[indices]
@@ -78,7 +81,7 @@ class GlobalGuidedAoERouter(nn.Module):
         all_expert_feats_flat = self.w_down(x_flat)
         expert_feats = all_expert_feats_flat.view(-1, self.num_experts, self.d_low)
 
-        # Step 2: 交互
+        # Step 2: 交互 (Interaction)
         global_ctx_raw = x.mean(dim=1)
         global_ctx = self.global_proj(global_ctx_raw)
 
@@ -89,36 +92,37 @@ class GlobalGuidedAoERouter(nn.Module):
         expert_feats_with_pos = expert_feats + self.expert_pos_embed
 
         # 拼接 3D 张量 -> [B*T, 1+N, d_low]
+        # 这里 input 都是 3D 的，不会报 "got 3 and 4" 的错
         interaction_seq = torch.cat([global_ctx_expanded, expert_feats_with_pos], dim=1)
 
         interacted_seq, _ = self.interaction_attn(interaction_seq, interaction_seq, interaction_seq)
         interacted_seq = self.norm(interacted_seq + interaction_seq)
+
+        # 取出更新后的特征 (去掉第0个Context)
         refined_feats = interacted_seq[:, 1:, :]
 
-        # Step 3: 全局引导决策
-        # Step 3: 全局引导决策
+        # Step 3: 全局引导决策 (Dual-Path)
+
+        # 路径 A (Local)
         local_logits = self.local_scorer(refined_feats).squeeze(-1)
 
-        # 【修改点 1】限制 Global Bias 的幅度！
-        # 使用 Tanh 限制在 [-1, 1]，然后乘以 2.0 放大到 [-2, 2]
-        # 这样它只能起到“引导”作用，而不能“主宰” Logits
+        # 路径 B (Global)
         global_bias = self.global_gate_mlp(global_ctx)
+
+        # 【关键防塌陷 1】限制 Global Bias 幅度，防止它“独裁”
         global_bias = torch.tanh(global_bias) * 2.0
 
         global_bias_expanded = global_bias.unsqueeze(1).expand(-1, num_tokens, -1).reshape(-1, self.num_experts)
 
         final_logits = local_logits + global_bias_expanded
 
-        # 【修改点 2】加大训练噪声 (Training Noise)
-        # 强迫 Router 去探索其他专家
+        # 【关键防塌陷 2】加大训练噪声到 1.0 (强迫 Router 探索)
         if self.training:
-            # 之前的 1.0/num_experts 太小了，直接给 1.0 的标准噪声
-            noise = torch.randn_like(final_logits) * 1.0
-            final_logits = final_logits + noise
+            final_logits = final_logits + torch.randn_like(final_logits) * 1.0
 
         router_probs = F.softmax(final_logits, dim=-1)
 
-        # Step 4: 执行 (Top-K)
+        # Step 4: 执行
         topk_weights, topk_indices = torch.topk(router_probs, self.topk, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
@@ -141,17 +145,16 @@ class GlobalGuidedAoERouter(nn.Module):
 
 class SharedGlobalGuidedAoEBlock(nn.Module):
     """
-    【最终版 Block】
-    = 1个 Shared Expert (处理背景) + Global Guided AoE Router (处理细节)
+    【最终版 Block】Shared Expert + Global Guided AoE
     """
 
     def __init__(self, dim, num_experts=8, active_experts=3):
         super().__init__()
 
-        # 1. 共享专家 (Shared Expert)
+        # 1. 共享专家
         self.shared_expert = ExpertLayer(dim)
 
-        # 2. 路由专家 (Global Guided AoE)
+        # 2. 路由专家
         self.moe = GlobalGuidedAoERouter(
             d_model=dim,
             num_experts=num_experts,
@@ -162,14 +165,13 @@ class SharedGlobalGuidedAoEBlock(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
 
-        # --- A. 共享专家路径 ---
+        # A. 共享路径
         shared_out = self.shared_expert(x)
 
-        # --- B. 路由专家路径 ---
-        # reshape 替代 transpose
+        # B. 路由路径
         x_tokens = x.flatten(2).transpose(1, 2)
         moe_out, aux_loss = self.moe(x_tokens)
         moe_out = moe_out.transpose(1, 2).reshape(B, C, H, W)
 
-        # --- C. 融合 ---
+        # C. 融合
         return x + shared_out + moe_out, aux_loss
