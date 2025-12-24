@@ -1,14 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sam2.modeling.fusion import SimpleFusionModule
+from sam2.modeling.fusion import DynamicFusionModule
 from sam2.modeling.segformer_head import SegFormerHead
 
 
 class SerialSAM2Backbone(nn.Module):
     """
-    【共享 MoE 版】串行骨干网 (修复 Hiera 遍历逻辑)
+    【共享 MoE 版】串行骨干网
     结构：Hiera Stage -> Shared MoE -> Hiera Stage -> ...
+    RGB 和 IR 共用同一组 MoE 参数。
     """
 
     def __init__(self, base_sam, moe_class, feature_channels=[96, 192, 384, 768], num_experts=8, active_experts=3):
@@ -19,7 +20,7 @@ class SerialSAM2Backbone(nn.Module):
         for param in self.base_sam.parameters():
             param.requires_grad = False
 
-        # 2. 构建共享的串行 MoE 层
+        # 2. 构建共享的串行 MoE 层 (Shared MoE)
         self.shared_moe_layers = nn.ModuleList([
             moe_class(dim=ch, num_experts=num_experts, active_experts=active_experts)
             for ch in feature_channels
@@ -29,75 +30,99 @@ class SerialSAM2Backbone(nn.Module):
         """ 单模态串行前向传播 """
         trunk = self.base_sam.image_encoder.trunk
 
-        # 1. Patch Embedding (切块)
+        # --- 1. Patch Embed & Pos Embed (带尺寸适配修复) ---
         x = trunk.patch_embed(image)
 
-        # 2. Positional Embedding (位置编码 - 自动插值)
-        if hasattr(trunk, "_get_pos_embed"):
-            x = x + trunk._get_pos_embed(x.shape[1:3])
-        elif trunk.pos_embed is not None:
-            x = x + trunk.pos_embed
+        if trunk.pos_embed is not None:
+            pos_embed = trunk.pos_embed
+            # 自动处理 1024x1024 预训练权重与 640x480 输入的尺寸不匹配问题
+            B, H, W, C = x.shape
+
+            # 检查格式是否为 NCHW (例如 [1, 96, 256, 256]), 如果是则转为 NHWC
+            if pos_embed.shape[-1] != C and pos_embed.shape[1] == C:
+                pos_embed = pos_embed.permute(0, 2, 3, 1)
+
+            # 如果尺寸不匹配，进行插值
+            if pos_embed.shape[1] != H or pos_embed.shape[2] != W:
+                pos_embed = pos_embed.permute(0, 3, 1, 2)  # NHWC -> NCHW
+                pos_embed = F.interpolate(
+                    pos_embed, size=(H, W), mode='bilinear', align_corners=False
+                )
+                pos_embed = pos_embed.permute(0, 2, 3, 1)  # NCHW -> NHWC
+
+            x = x + pos_embed
 
         features = []
         total_aux_loss = 0.0
 
-        # --- 修复点：根据 stage_ends 手动拆分 blocks ---
-        # Hiera 没有 .stages 属性，只有一个平铺的 .blocks 列表
-        # stage_ends 记录了每个 Stage 最后一个 block 的索引 (例如 [1, 4, 20, 23])
-        start_idx = 0
+        # --- 2. 逐 Block 运行，并在 Stage 结束时插入 MoE ---
+        # 修复点：Hiera 没有 .stages 属性，只有 .blocks 和 .stage_ends
 
-        # 遍历 4 个阶段 (假设 trunk.stage_ends 长度为 4)
-        for i, end_idx in enumerate(trunk.stage_ends):
-            # A. 取出当前 Stage 的所有 Blocks 并执行
-            # 这里的 slice 操作是左闭右开，所以用 end_idx + 1
-            stage_blocks = trunk.blocks[start_idx: end_idx + 1]
-            start_idx = end_idx + 1  # 更新下一轮起点
+        stage_idx = 0
+        for i, blk in enumerate(trunk.blocks):
+            # A. 跑 Hiera Block (冻结)
+            x = blk(x)
 
-            for block in stage_blocks:
-                x = block(x)
+            # B. 检查当前 Block 是否是某个 Stage 的结尾
+            # trunk.stage_ends 存储了每个 stage 最后一个 block 的索引 (例如 [1, 4, 20, 23])
+            if i in trunk.stage_ends:
+                # 到了 Stage 结尾，执行 MoE
 
-            # 此时 x 是当前 Stage 的输出 (例如 Stage 1 跑完是 120x160)
+                # 1. 跑 MoE (共享参数)
+                # MoE 期望输入: [B, C, H, W]
+                x_in = x.permute(0, 3, 1, 2)
+                x_out, aux_loss = moe_layers[stage_idx](x_in)
+                total_aux_loss += aux_loss
 
-            # B. 跑 MoE (共享参数)
-            # Hiera 输出是 NHWC [B, H, W, C]，MoE 需要 NCHW [B, C, H, W]
-            x_in = x.permute(0, 3, 1, 2)
-            x_out, aux_loss = moe_layers[i](x_in)
-            total_aux_loss += aux_loss
+                # 2. 残差连接 (x是NHWC, x_out是NCHW -> 转回NHWC)
+                x = x + x_out.permute(0, 2, 3, 1)
 
-            # C. 残差连接 (MoE 结果加回主干)
-            # 将增强后的特征加回数据流，供下一阶段使用
-            x = x + x_out.permute(0, 2, 3, 1)
+                # 3. 收集特征 (输出 NCHW)
+                features.append(x.permute(0, 3, 1, 2))
 
-            # D. 收集特征 (转回 NCHW 供后续 Head 使用)
-            features.append(x.permute(0, 3, 1, 2))
+                # 进入下一个 Stage
+                stage_idx += 1
 
         return features, total_aux_loss
 
     def forward(self, img_rgb, img_ir):
-        # RGB 和 IR 都传入 self.shared_moe_layers
         feats_rgb, loss_rgb = self.run_serial_stream(img_rgb, self.shared_moe_layers)
         feats_ir, loss_ir = self.run_serial_stream(img_ir, self.shared_moe_layers)
-
-        # MoE Loss 是两者的总和
         return feats_rgb, feats_ir, (loss_rgb + loss_ir)
 
 
 class SerialSegModel(nn.Module):
-    """ 纯分割模型 (适配共享 MoE Backbone) """
+    """
+    基础分割模型 (适配 Dynamic Fusion + Shared MoE)
+    """
 
     def __init__(self, base_sam, moe_class, num_classes=9):
         super().__init__()
         self.backbone = SerialSAM2Backbone(base_sam, moe_class)
         channels = [96, 192, 384, 768]
 
-        self.fusion_layers = nn.ModuleList([SimpleFusionModule(ch) for ch in channels])
+        # 确保使用 DynamicFusionModule
+        self.fusion_layers = nn.ModuleList([DynamicFusionModule(ch) for ch in channels])
+
         self.segformer_head = SegFormerHead(in_channels=channels, num_classes=num_classes)
 
-    def forward(self, vis, ir):
+    def forward(self, vis, ir, gt_entropy_maps=None):
         feats_rgb, feats_ir, moe_loss = self.backbone(vis, ir)
 
-        fused = [self.fusion_layers[i](feats_rgb[i], feats_ir[i]) for i in range(4)]
-        logits = self.segformer_head(fused)
+        fused_features = []
+        total_fusion_loss = 0.0
+
+        for i in range(4):
+            # 获取对应层级的熵图 (如果存在)
+            gt_ent = gt_entropy_maps[i] if (gt_entropy_maps is not None) else None
+
+            # DynamicFusionModule 返回 (特征, 蒸馏Loss)
+            f_out, f_loss = self.fusion_layers[i](feats_ir[i], feats_rgb[i], gt_ent)
+
+            fused_features.append(f_out)
+            total_fusion_loss += f_loss
+
+        logits = self.segformer_head(fused_features)
         logits = F.interpolate(logits, size=vis.shape[2:], mode='bilinear')
 
-        return logits, moe_loss
+        return logits, moe_loss, total_fusion_loss

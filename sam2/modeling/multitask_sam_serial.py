@@ -2,27 +2,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sam2.modeling.serial_modeling import SerialSegModel
+from sam2.modeling.fusion import DynamicFusionModule
 
 
 class MultiTaskSerialModel(SerialSegModel):
     """
-    多任务模型：Shared Serial MoE + SAM2 Aux (Only Stage 4 Supervision)
-    修复：
-    1. 适配 SAM 2.1 接口 (repeat_image, 4个返回值)
-    2. 修复 Dense Prompt 维度不匹配问题 (增加插值逻辑)
+    多任务模型 V7 (返回值修复版):
+    1. Backbone: Shared MoE (串行)
+    2. Fusion: Dynamic Fusion (带蒸馏)
+    3. Aux Head: 修复 MaskDecoder 返回值解包错误 (4个返回值)
     """
 
     def __init__(self, base_sam, moe_class, num_classes=9):
         super().__init__(base_sam, moe_class, num_classes)
 
-        # 冻结 SAM 解码器组件
+        # 1. 融合层
+        channels = [96, 192, 384, 768]
+        self.fusion_layers = nn.ModuleList([
+            DynamicFusionModule(dim=ch) for ch in channels
+        ])
+
+        # 2. 冻结 SAM 组件
         for param in self.backbone.base_sam.sam_prompt_encoder.parameters(): param.requires_grad = False
         for param in self.backbone.base_sam.sam_mask_decoder.parameters(): param.requires_grad = False
+        # 冻结 Neck
+        for param in self.backbone.base_sam.image_encoder.neck.parameters(): param.requires_grad = False
 
-        # 强制关闭 high_res_features，确保只使用 Stage 4 特征
-        self.backbone.base_sam.sam_mask_decoder.use_high_res_features = False
-
-        # SAM2 适配层 (Stage 4: 768 -> 256)
+        # 3. 适配层
         self.sam_proj_s4 = nn.Conv2d(768, 256, kernel_size=1)
 
     def get_prompt(self, gt):
@@ -40,60 +46,115 @@ class MultiTaskSerialModel(SerialSegModel):
         return torch.tensor(coords, device=gt.device).unsqueeze(1).float(), \
             torch.tensor(labels, device=gt.device).unsqueeze(1)
 
-    def run_sam_head(self, feat, gt, proj):
+    def run_sam_head(self, feat, gt, proj, high_res_features=None):
         # 1. 投影特征
-        sam_feat = proj(feat)  # [B, 256, H/32, W/32]
-        target_size = sam_feat.shape[-2:]  # (15, 20)
+        sam_feat = proj(feat)
 
-        # 2. 获取 Prompt (Sparse & Dense)
+        # 2. 基础对齐: Stride 32 -> 16
+        if high_res_features is not None:
+            sam_feat = F.interpolate(
+                sam_feat, scale_factor=2.0, mode='bilinear', align_corners=False
+            )
+
+        # 3. 强制对齐高分特征
+        if high_res_features is not None:
+            feat_s0, feat_s1 = high_res_features
+
+            # feat_s1 必须是 sam_feat 的 2 倍
+            target_h_s1 = sam_feat.shape[-2] * 2
+            target_w_s1 = sam_feat.shape[-1] * 2
+            if feat_s1.shape[-2] != target_h_s1 or feat_s1.shape[-1] != target_w_s1:
+                feat_s1 = F.interpolate(feat_s1, size=(target_h_s1, target_w_s1),
+                                        mode='bilinear', align_corners=False)
+
+            # feat_s0 必须是 sam_feat 的 4 倍
+            target_h_s0 = sam_feat.shape[-2] * 4
+            target_w_s0 = sam_feat.shape[-1] * 4
+            if feat_s0.shape[-2] != target_h_s0 or feat_s0.shape[-1] != target_w_s0:
+                feat_s0 = F.interpolate(feat_s0, size=(target_h_s0, target_w_s0),
+                                        mode='bilinear', align_corners=False)
+
+            high_res_features = [feat_s0, feat_s1]
+
+        # 4. 获取提示
         pt_c, pt_l = self.get_prompt(gt)
         sparse, dense = self.backbone.base_sam.sam_prompt_encoder(points=(pt_c, pt_l), boxes=None, masks=None)
 
-        # --- 核心修复区 Start ---
-
-        # 3. 处理 PE (位置编码) 插值
+        # 5. PE 和 Dense 插值
         pe = self.backbone.base_sam.sam_prompt_encoder.get_dense_pe()
-        if pe.shape[-2:] != target_size:
-            pe = F.interpolate(pe, size=target_size, mode='bilinear', align_corners=False)
+        if pe.shape[-2:] != sam_feat.shape[-2:]:
+            pe = F.interpolate(pe, size=sam_feat.shape[-2:], mode='bilinear')
 
-        # 4. 处理 Dense Prompt (密集提示) 插值 <--- 之前漏了这一步
-        # dense 的默认形状是 [B, 256, 64, 64]，必须缩放到 [B, 256, 15, 20] 才能相加
-        if dense.shape[-2:] != target_size:
-            dense = F.interpolate(dense, size=target_size, mode='bilinear', align_corners=False)
+        if dense.shape[-2:] != sam_feat.shape[-2:]:
+            dense = F.interpolate(dense, size=sam_feat.shape[-2:], mode='bilinear')
 
-        # --- 核心修复区 End ---
-
-        # 5. 解码
-        low_res_masks, iou_pred, _, _ = self.backbone.base_sam.sam_mask_decoder(
+        # 6. 运行解码器 (★★★ 修复核心：接收4个返回值 ★★★)
+        low_res, iou_pred, _, _ = self.backbone.base_sam.sam_mask_decoder(
             image_embeddings=sam_feat,
             image_pe=pe,
             sparse_prompt_embeddings=sparse,
-            dense_prompt_embeddings=dense,  # 现在的 dense 尺寸已经对齐了
+            dense_prompt_embeddings=dense,
             multimask_output=False,
             repeat_image=False,
-            high_res_features=None
+            high_res_features=high_res_features
         )
-        return low_res_masks
+        return low_res
 
-    def forward(self, vis, ir, gt_semantic=None):
-        # 1. 基础分割流
+    def _prepare_high_res_features(self, neck_out):
+        """ 拆包并投影 """
+
+        def unwrap(t):
+            return t[0] if isinstance(t, (list, tuple)) else t
+
+        decoder = self.backbone.base_sam.sam_mask_decoder
+
+        # 投影
+        feat_s0 = decoder.conv_s0(unwrap(neck_out[0]))
+        feat_s1 = decoder.conv_s1(unwrap(neck_out[1]))
+
+        return [feat_s0, feat_s1]
+
+    def forward(self, vis, ir, gt_semantic=None, gt_entropy_maps=None):
+        # 1. 基础流
         feats_rgb, feats_ir, moe_loss = self.backbone(vis, ir)
 
-        fused = [self.fusion_layers[i](feats_rgb[i], feats_ir[i]) for i in range(4)]
-        logits = self.segformer_head(fused)
-        logits = F.interpolate(logits, size=vis.shape[2:], mode='bilinear')
+        # 2. Fusion 流
+        fused = []
+        total_fusion_loss = 0
+        for i in range(4):
+            gt_ent = gt_entropy_maps[i] if (gt_entropy_maps is not None) else None
+            f_out, f_loss = self.fusion_layers[i](feats_ir[i], feats_rgb[i], gt_ent)
+            fused.append(f_out)
+            total_fusion_loss += f_loss
 
-        # 2. SAM 辅助流
+        # 主任务
+        seg_logits = self.segformer_head(fused)
+        seg_logits = F.interpolate(seg_logits, size=vis.shape[2:], mode='bilinear')
+
+        # 3. SAM 辅助流
         sam_preds = {}
         if gt_semantic is not None:
             H, W = vis.shape[2:]
 
-            # RGB Stage 4
-            out_r = self.run_sam_head(feats_rgb[-1], gt_semantic, self.sam_proj_s4)
+            with torch.no_grad():
+                neck_out_rgb = self.backbone.base_sam.image_encoder.neck(feats_rgb)
+                neck_out_ir = self.backbone.base_sam.image_encoder.neck(feats_ir)
+
+            # 准备特征
+            high_res_rgb = self._prepare_high_res_features(neck_out_rgb)
+            high_res_ir = self._prepare_high_res_features(neck_out_ir)
+
+            # 预测
+            out_r = self.run_sam_head(
+                feats_rgb[-1], gt_semantic, self.sam_proj_s4,
+                high_res_features=high_res_rgb
+            )
             sam_preds['rgb_s4'] = F.interpolate(out_r, size=(H, W), mode='bilinear')
 
-            # IR Stage 4
-            out_i = self.run_sam_head(feats_ir[-1], gt_semantic, self.sam_proj_s4)
+            out_i = self.run_sam_head(
+                feats_ir[-1], gt_semantic, self.sam_proj_s4,
+                high_res_features=high_res_ir
+            )
             sam_preds['ir_s4'] = F.interpolate(out_i, size=(H, W), mode='bilinear')
 
-        return logits, sam_preds, moe_loss
+        return seg_logits, sam_preds, moe_loss, total_fusion_loss
