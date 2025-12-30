@@ -1,35 +1,37 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sam2.modeling.serial_modeling import SerialSegModel
+from sam2.modeling.serial_modeling import SerialSegModel, _get_hiera_dim
 from sam2.modeling.fusion import DynamicFusionModule
 
 
 class MultiTaskSerialModel(SerialSegModel):
     """
-    多任务模型 V7 (返回值修复版):
-    1. Backbone: Shared MoE (串行)
-    2. Fusion: Dynamic Fusion (带蒸馏)
-    3. Aux Head: 修复 MaskDecoder 返回值解包错误 (4个返回值)
+    多任务模型 V7 (维度自适应版)
     """
 
     def __init__(self, base_sam, moe_class, num_classes=9):
+        # 1. 调用父类初始化 (父类会自动检测维度并初始化 Backbone 和 Head)
         super().__init__(base_sam, moe_class, num_classes)
 
-        # 1. 融合层
-        channels = [96, 192, 384, 768]
+        # 2. 重新获取维度 (因为 super().__init__ 里的 fusion_layers 会被这里覆盖)
+        embed_dim = _get_hiera_dim(base_sam.image_encoder.trunk)
+        channels = [embed_dim * (2 ** i) for i in range(4)]
+
+        # 3. 重新初始化 Fusion 层
         self.fusion_layers = nn.ModuleList([
             DynamicFusionModule(dim=ch) for ch in channels
         ])
 
-        # 2. 冻结 SAM 组件
+        # 4. 冻结 SAM 组件
         for param in self.backbone.base_sam.sam_prompt_encoder.parameters(): param.requires_grad = False
         for param in self.backbone.base_sam.sam_mask_decoder.parameters(): param.requires_grad = False
         # 冻结 Neck
         for param in self.backbone.base_sam.image_encoder.neck.parameters(): param.requires_grad = False
 
-        # 3. 适配层
-        self.sam_proj_s4 = nn.Conv2d(768, 256, kernel_size=1)
+        # 5. 适配层 (SAM Head 投影)
+        # 自动使用最后一层维度
+        self.sam_proj_s4 = nn.Conv2d(channels[-1], 256, kernel_size=1)
 
     def get_prompt(self, gt):
         B, H, W = gt.shape
@@ -88,7 +90,7 @@ class MultiTaskSerialModel(SerialSegModel):
         if dense.shape[-2:] != sam_feat.shape[-2:]:
             dense = F.interpolate(dense, size=sam_feat.shape[-2:], mode='bilinear')
 
-        # 6. 运行解码器 (★★★ 修复核心：接收4个返回值 ★★★)
+        # 6. 运行解码器
         low_res, iou_pred, _, _ = self.backbone.base_sam.sam_mask_decoder(
             image_embeddings=sam_feat,
             image_pe=pe,
@@ -107,18 +109,13 @@ class MultiTaskSerialModel(SerialSegModel):
             return t[0] if isinstance(t, (list, tuple)) else t
 
         decoder = self.backbone.base_sam.sam_mask_decoder
-
-        # 投影
         feat_s0 = decoder.conv_s0(unwrap(neck_out[0]))
         feat_s1 = decoder.conv_s1(unwrap(neck_out[1]))
-
         return [feat_s0, feat_s1]
 
     def forward(self, vis, ir, gt_semantic=None, gt_entropy_maps=None):
-        # 1. 基础流
         feats_rgb, feats_ir, moe_loss = self.backbone(vis, ir)
 
-        # 2. Fusion 流
         fused = []
         total_fusion_loss = 0
         for i in range(4):
@@ -140,11 +137,9 @@ class MultiTaskSerialModel(SerialSegModel):
                 neck_out_rgb = self.backbone.base_sam.image_encoder.neck(feats_rgb)
                 neck_out_ir = self.backbone.base_sam.image_encoder.neck(feats_ir)
 
-            # 准备特征
             high_res_rgb = self._prepare_high_res_features(neck_out_rgb)
             high_res_ir = self._prepare_high_res_features(neck_out_ir)
 
-            # 预测
             out_r = self.run_sam_head(
                 feats_rgb[-1], gt_semantic, self.sam_proj_s4,
                 high_res_features=high_res_rgb

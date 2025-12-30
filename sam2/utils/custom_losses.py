@@ -77,4 +77,4 @@ class StandardSegLoss(nn.Module):
         union = pred_soft.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
         loss_dice = 1 - (2. * inter + 1) / (union + 1)
 
-        return 0.3 * loss_ce + 0.7 * loss_dice.mean()
+        return 0.2 * loss_ce + 0.8 * loss_dice.mean()

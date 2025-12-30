@@ -10,16 +10,17 @@ from sam2.build_sam import build_sam2
 from sam2.modeling.global_guided_aoe import GlobalGuidedAoEBlock
 from sam2.modeling.multitask_sam_serial import MultiTaskSerialModel
 
-EXP_NAME = "Exp_DynamicFusion_Final"
-CHECKPOINT_PATH = f"checkpoints/{EXP_NAME}/best_model.pth"
+EXP_NAME = "Exp_DynamicFusion_Final"  # 可根据需要修改为对应实验名
+# 修改为新的最佳权重路径
+CHECKPOINT_PATH = "/home/mmsys/disk/MCL/MultiModal_Project-uncertainty/sam2/checkpoints/Exp_MultiTask_SUM_Stage4Only/best_model.pth"
 TEST_DIRS = {
     'vi': '/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/test/vi',
     'ir': '/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/test/ir',
     'label': '/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/test/Segmentation_labels'
 }
-SAVE_DIR = f"results/{EXP_NAME}_vis"
-SAM_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
-SAM_CKPT = "../checkpoints/sam2.1_hiera_tiny.pt"
+SAVE_DIR = f"results/{EXP_NAME}_vis"  # 结果保存路径可根据EXP_NAME自动调整
+SAM_CFG = "configs/sam2.1/sam2.1_hiera_s.yaml"
+SAM_CKPT = "../checkpoints/sam2.1_hiera_small.pt"
 NUM_CLASSES = 9
 CLASS_NAMES = ['BackG', 'Car', 'Person', 'Bike', 'Curve', 'CarStop', 'Guardrail', 'Cone', 'Bump']
 PALETTE = np.array([
