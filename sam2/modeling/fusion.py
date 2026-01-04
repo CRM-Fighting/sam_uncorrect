@@ -1,196 +1,200 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+import cv2
+import numpy as np
 
 
-# --- 1. Agent (吸纳豆包：可学习温度系数) ---
+# --- 1. Agent (预测权重) ---
 class SamplingAgent(nn.Module):
     def __init__(self, in_channels, hidden_dim=512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=1),
-            nn.SiLU(inplace=True),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim, 1, kernel_size=1)
         )
-        # 初始化为 1.0，让网络自己学温度
-        self.temp = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, f_ir, f_vis):
         x = torch.cat([f_ir, f_vis], dim=1)
-        # 限制温度范围，防止除以 0 或梯度爆炸
-        temp = torch.clamp(self.temp, 0.1, 10.0)
-        return torch.sigmoid(self.net(x) / temp)
+        return torch.sigmoid(self.net(x))
 
 
-# --- 2. Router (吸纳豆包：温和初始化) ---
+# --- 2. Router (教师) ---
 class Router(nn.Module):
     def __init__(self, in_channels=1):
         super().__init__()
         self.net = nn.Conv2d(in_channels, 1, kernel_size=1)
-        self._init_weights()
-
-    def _init_weights(self):
-        # 使得初始输出在 0.5 附近，避免开局“偏科”
-        nn.init.xavier_normal_(self.net.weight)
+        nn.init.xavier_normal_(self.net.weight, gain=0.01)
         nn.init.constant_(self.net.bias, 0.0)
 
     def forward(self, entropy_map):
         return torch.sigmoid(self.net(entropy_map))
 
 
-# --- 3. HyperNetwork (吸纳豆包：像素级阈值 + 自适应) ---
-class PixelWiseHyperNet(nn.Module):
-    def __init__(self, in_channels):
+# --- 3. HyperNetwork (筛选器) ---
+class HyperNetwork(nn.Module):
+    def __init__(self, in_dim=1):
         super().__init__()
-        # 1x1 卷积，为每个像素生成独立的阈值
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels * 2, 256, kernel_size=1),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(256, 1, kernel_size=1),
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
             nn.Sigmoid()
         )
 
-    def forward(self, f_ir, f_vis):
-        x = torch.cat([f_ir, f_vis], dim=1)
-        threshold = self.conv(x)  # [B, 1, H, W]
+    def forward(self, weights):
+        # 找红蓝边缘 (0 或 1)
+        importance = (weights - 0.5).abs()
+        global_stat = importance.mean(dim=(2, 3)).view(-1, 1)
+        k_ratio = self.mlp(global_stat)
+        return k_ratio * 0.8 + 0.1
 
-        # 这里的 Trick 是：阈值不能脱离全图的统计分布
-        # 我们让阈值 = 局部预测 * 0.8 + 全局均值 * 0.2
-        # 这样既有像素级差异，又有全局视野
-        global_mean = torch.mean(x, dim=[1, 2, 3], keepdim=True)
-        # 这里的 global_mean 需要过一个简单的变换映射到 0-1，或者直接用 threshold 自身
-        # 为了稳定，直接限制 threshold 范围
-        return torch.clamp(threshold, 0.05, 0.95)
+    # --- 4. Mixer (稀疏精修) ---
 
 
-# --- 4. EfficientAttention (吸纳豆包：数值防护 EPS) ---
-class EfficientAttention(nn.Module):
-    def __init__(self, dim, num_heads=8):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.eps = 1e-8  # 防 NaN
-
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        # 数值稳定 Softmax
-        q = q.softmax(dim=-1)
-        k = k.softmax(dim=-2)
-
-        context = torch.matmul(k.transpose(-2, -1), v)
-        # 这里的 context 可能很小，加 eps 防止后续计算问题 (可选)
-        out = torch.matmul(q, context)
-
-        out = out.transpose(1, 2).reshape(B, N, C)
-        return self.proj(out)
-
-
-# --- 5. MixerBlock (吸纳豆包：Dropout 防止过拟合) ---
 class MixerBlock(nn.Module):
     def __init__(self, dim, num_heads=4):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = EfficientAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Dropout(0.1),  # 加点 Dropout 确实对小数据集有好处
-            nn.Linear(dim * 4, dim),
-            nn.Dropout(0.1)
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
         )
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
+        x_norm = self.norm(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + attn_out
+        x = x + self.ffn(self.norm(x))
         return x
 
 
-# --- 6. DynamicFusionModule (集大成者) ---
+# --- 5. SparseReconstructionFusion (论文级命名) ---
 class DynamicFusionModule(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.eps = 1e-8
-
         self.agent = SamplingAgent(dim)
-        self.router = Router(in_channels=1)
-        # 改用像素级 HyperNet
-        self.hypernet = PixelWiseHyperNet(dim)
+        self.router = Router()
+        self.hypernet = HyperNetwork()
 
         self.mixer_ir = MixerBlock(dim)
         self.mixer_vis = MixerBlock(dim)
 
-        # 可学习 STE 温度
-        self.ste_temp = nn.Parameter(torch.tensor(5.0))
+        # 荧光笔增强系数
+        self.highlight_scale = nn.Parameter(torch.tensor(1.0))
+
+        # 可视化
+        self.vis_count = 0
+        self.vis_dir = "vis_reconstruction"
+        os.makedirs(self.vis_dir, exist_ok=True)
 
     def forward(self, f_ir, f_vis, gt_entropy=None):
         B, C, H, W = f_ir.shape
         N = H * W
 
-        # 1. Agent 预测权重
-        pred_weights = self.agent(f_ir, f_vis)
+        # 1. 准备全局背景特征 (Background Context)
+        # 这是"填充"用的材料，对应简单的 Baseline 效果
+        bg_context_feat = f_ir + f_vis
 
-        # 2. 训练/测试分支
+        # 2. Agent 预测权重
+        weights = self.agent(f_ir, f_vis)  # [B, 1, H, W]
+
+        aux_loss = torch.tensor(0.0, device=f_ir.device)
         if self.training and gt_entropy is not None:
-            target_weights = self.router(gt_entropy)
-            active_weights = target_weights
-            # ★ 修正豆包错误：F.mse_loss 默认就是 mean，不要再除以 N 了！
-            aux_loss = F.mse_loss(pred_weights, target_weights.detach())
-        else:
-            active_weights = pred_weights
-            aux_loss = torch.tensor(0.0, device=f_ir.device)
+            target = self.router(gt_entropy)
+            aux_loss = F.mse_loss(weights, target.detach())
 
-        # 3. 像素级阈值
-        threshold = self.hypernet(f_ir, f_vis)  # [B, 1, H, W]
+        # 3. 筛选逻辑：红蓝边缘
+        score_map = (weights - 0.5).abs()
+        k_ratio = self.hypernet(weights.detach())
+        flat_score = score_map.flatten(2)  # [B, 1, N]
 
-        # 4. STE 可导掩码 (核心优化)
-        diff = active_weights - threshold
-        ste_temp = torch.clamp(self.ste_temp, 1.0, 20.0)  # 限制温度范围
+        # ★★★ 重构画布 (The Canvas) ★★★
+        # 初始化一个全 0 的画布，我们后面要在上面"填空"
+        # 这种写法在论文里叫 "Zero-initialized Feature Canvas"
+        reconstructed_canvas = torch.zeros((B, C, N), device=f_ir.device)
 
-        mask_hard = (diff > 0).float()
-        mask_soft = torch.sigmoid(diff * ste_temp)
-        # 前向 Hard，反向 Soft
-        mask = mask_hard - mask_soft.detach() + mask_soft
+        for b in range(B):
+            # --- Step A: 确定哪些是前景(边缘)，哪些是背景 ---
+            k = int(N * k_ratio[b].item())
+            k = max(k, 64)
 
-        # 5. 准备数据
-        flat_ir = f_ir.flatten(2).transpose(1, 2)
-        flat_vis = f_vis.flatten(2).transpose(1, 2)
-        flat_weights = active_weights.flatten(2).transpose(1, 2)
-        flat_mask = mask.flatten(2).transpose(1, 2)
+            # topk_idx: 选中的边缘索引 (Sparse Indices)
+            _, topk_idx = torch.topk(flat_score[b], k, dim=1)  # [1, K]
 
-        # 6. 软加权应用掩码 (Soft Masking)
-        # 豆包说得对：直接置 0 容易 NaN。
-        # 我们这里虽然看起来像置 0，但因为 mask 是 0/1，其实就是置 0。
-        # 为了防止 Attention 里的 Softmax(0) 问题，我们在 EfficientAttention 里加了 eps，所以这里可以放心用。
-        masked_ir = flat_ir * flat_mask
-        masked_vis = flat_vis * flat_mask
+            # --- Step B: 生成背景掩码 ---
+            # 创建一个全1掩码，把选中的地方扣掉，剩下的就是背景
+            # 这就是你说的 "剩余的像素点"
+            all_indices = torch.arange(N, device=f_ir.device).unsqueeze(0)  # [1, N]
+            # 为了简单起见，我们直接利用 scatter 的特性
+            # 我们不需要显式获得背景索引，只需要用 scatter 覆盖即可
 
-        # 7. 特征精修
-        refined_ir = self.mixer_ir(masked_ir)
-        refined_vis = self.mixer_vis(masked_vis)
+            # --- Step C: 处理前景 (Edge Processing Stream) ---
+            idx_expanded = topk_idx.transpose(0, 1).expand(-1, C)  # [K, C]
 
-        # 8. 残差回填 (Delta Injection)
-        # 只在 mask=1 的地方回填残差
-        delta_ir = (refined_ir - masked_ir) * flat_mask
-        # 加上 Clamp 防止梯度爆炸
-        final_ir = flat_ir + delta_ir.clamp(-1.0, 1.0)
+            # 提取
+            flat_ir_b = f_ir[b].flatten(1).transpose(0, 1)
+            flat_vis_b = f_vis[b].flatten(1).transpose(0, 1)
+            selected_ir = torch.gather(flat_ir_b, 0, idx_expanded).unsqueeze(0)
+            selected_vis = torch.gather(flat_vis_b, 0, idx_expanded).unsqueeze(0)
 
-        delta_vis = (refined_vis - masked_vis) * flat_mask
-        final_vis = flat_vis + delta_vis.clamp(-1.0, 1.0)
+            # 精修
+            refined_ir = self.mixer_ir(selected_ir)
+            refined_vis = self.mixer_vis(selected_vis)
 
-        # 9. 终极融合 (全图加权)
-        # 加上 clamp 防止权重极值
-        flat_weights = torch.clamp(flat_weights, self.eps, 1 - self.eps)
-        f_fused_flat = final_ir * flat_weights + final_vis * (1 - flat_weights)
+            # 融合增量
+            w_selected = torch.gather(weights[b].flatten(), 0, topk_idx.squeeze(0)).view(1, -1, 1)
+            mixer_delta = refined_ir * w_selected + refined_vis * (1 - w_selected)
 
-        # 10. 还原
-        f_final = f_fused_flat.transpose(1, 2).view(B, C, H, W)
+            # 荧光笔增强
+            # 取出 Base 部分 (Base + Detail)
+            flat_base_b = bg_context_feat[b].flatten(1).transpose(0, 1)  # [N, C]
+            base_selected = torch.gather(flat_base_b, 0, idx_expanded).unsqueeze(0)
 
+            score_selected = torch.gather(flat_score[b].flatten(), 0, topk_idx.squeeze(0)).view(1, -1, 1)
+            modulation = 1.0 + score_selected * self.highlight_scale
+
+            # 得到最终的边缘特征 (Enhanced Foreground Features)
+            final_edge_feat = (base_selected + mixer_delta) * modulation
+
+            # --- Step D: 处理背景 (Background Filling Stream) ---
+            # 我们先假设全图都是背景
+            final_flat_b = flat_base_b.clone()  # [N, C]
+
+            # --- Step E: 填充重构 (In-painting / Filling) ---
+            # ★★★ 你的核心需求在这里实现 ★★★
+            # 逻辑：
+            # 1. 画布上先铺满了背景 (Background Context)
+            # 2. 我们把计算好的 "final_edge_feat" 强制覆盖(scatter)到对应的位置
+            # 这相当于：先画边缘，再填背景（代码实现上是先铺背景再修边缘，效果完全等价，且效率更高）
+
+            # 使用 scatter_ (注意没有add) 进行覆盖
+            # 将增强后的边缘，填入到全图特征中
+            final_flat_b.scatter_(0, idx_expanded, final_edge_feat.squeeze(0))
+
+            # 放入 Batch 列表
+            reconstructed_canvas[b] = final_flat_b.transpose(0, 1)
+
+            # 可视化 (可选)
+            if self.training and self.vis_count % 200 == 0 and b == 0:
+                self._visualize_reconstruction(topk_idx, H, W, f_ir.device)
+            if b == 0: self.vis_count += 1
+
+        # 还原形状
+        f_final = reconstructed_canvas.view(B, C, H, W)
         return f_final, aux_loss
+
+    def _visualize_reconstruction(self, topk_idx, H, W, device):
+        try:
+            # 0为背景，255为边缘
+            mask = torch.zeros((H * W), device=device)
+            mask.scatter_(0, topk_idx.squeeze(0), 1.0)
+            mask = mask.view(H, W).cpu().numpy()
+            save_path = os.path.join(self.vis_dir, f"recon_mask_{self.vis_count}.png")
+            cv2.imwrite(save_path, (mask * 255).astype(np.uint8))
+        except:
+            pass

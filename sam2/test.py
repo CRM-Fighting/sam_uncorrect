@@ -9,10 +9,10 @@ from prettytable import PrettyTable
 from sam2.build_sam import build_sam2
 from sam2.modeling.global_guided_aoe import GlobalGuidedAoEBlock
 from sam2.modeling.multitask_sam_serial import MultiTaskSerialModel
-
+from torchvision import transforms # 记得导入
 EXP_NAME = "Exp_DynamicFusion_Final"  # 可根据需要修改为对应实验名
 # 修改为新的最佳权重路径
-CHECKPOINT_PATH = "/home/mmsys/disk/MCL/MultiModal_Project-uncertainty/sam2/checkpoints/Exp_MultiTask_SUM_Stage4Only/best_model.pth"
+CHECKPOINT_PATH = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/checkpoints/Exp_MultiTask_SUM_Stage4Only/best_model.pth"
 TEST_DIRS = {
     'vi': '/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/test/vi',
     'ir': '/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/test/ir',
@@ -34,11 +34,24 @@ class TestDataset(torch.utils.data.Dataset):
         self.ir = dirs['ir']
         self.lbl = dirs['label']
         self.files = sorted([f for f in os.listdir(self.vis) if f.endswith('.png')])
+        # ✅ 添加与训练一致的归一化
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+
     def __len__(self): return len(self.files)
+
     def __getitem__(self, i):
         n = self.files[i]
-        v = torch.from_numpy(np.array(Image.open(os.path.join(self.vis, n)).convert('RGB').resize((640, 480)))).float().permute(2, 0, 1) / 255.0
-        i_img = torch.from_numpy(np.array(Image.open(os.path.join(self.ir, n)).convert('RGB').resize((640, 480)))).float().permute(2, 0, 1) / 255.0
+        # 读取并归一化 RGB
+        v_tensor = torch.from_numpy(np.array(Image.open(os.path.join(self.vis, n)).convert('RGB').resize((640, 480)))).float().permute(2, 0, 1) / 255.0
+        v = self.normalize(v_tensor) # ✅ 应用归一化
+
+        # 读取并归一化 IR
+        i_tensor = torch.from_numpy(np.array(Image.open(os.path.join(self.ir, n)).convert('RGB').resize((640, 480)))).float().permute(2, 0, 1) / 255.0
+        i_img = self.normalize(i_tensor) # ✅ 应用归一化
+
         l = torch.from_numpy(np.array(Image.open(os.path.join(self.lbl, n)).resize((640, 480), Image.NEAREST))).long()
         return v, i_img, l, n
 
