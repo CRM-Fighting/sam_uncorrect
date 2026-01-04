@@ -26,7 +26,7 @@ from sam2.modeling.multitask_sam_serial import MultiTaskSerialModel
 from utils.custom_losses import BinarySUMLoss, StandardSegLoss
 
 # --- 配置区域 ---
-EXP_NAME = "map_path_correct_12_31"
+EXP_NAME = "visual_correct_1_4"
 
 # 路径配置
 ENTROPY_ROOT = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/entropy_maps"

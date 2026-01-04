@@ -86,15 +86,17 @@ class DynamicFusionModule(nn.Module):
 
         self.highlight_scale = nn.Parameter(torch.tensor(1.0))
 
-        # --- 可视化配置 (修改部分) ---
+        # ★★★ 修复点 1: 可学习的温度系数，初始化为 20.0 ★★★
+        self.temperature = nn.Parameter(torch.ones(1) * 20.0)
+
+        # ★★★ 修改: 不再需要 target_sparsity 这个固定值了 ★★★
+        # self.target_sparsity = 0.2  <-- 删掉或忽略
+
+        # --- 可视化配置 ---
         self.vis_count = 0
         self.vis_root = "vis_reconstruction"
-
-        # 分别定义训练和验证的保存路径
         self.vis_train_dir = os.path.join(self.vis_root, "train")
         self.vis_val_dir = os.path.join(self.vis_root, "val")
-
-        # 自动创建文件夹
         os.makedirs(self.vis_train_dir, exist_ok=True)
         os.makedirs(self.vis_val_dir, exist_ok=True)
 
@@ -105,29 +107,47 @@ class DynamicFusionModule(nn.Module):
 
         bg_context_feat = f_ir + f_vis
 
-        # --- Phase 1: 角色分配 (Teacher vs Student) ---
-
-        # 1. 学生 (Agent) 始终要预测
+        # --- Phase 1: 角色分配 ---
         weights_student, student_logits = self.agent(f_ir, f_vis)
+        aux_loss = torch.tensor(0.0, device=device)
 
-        # 2. 决定谁来掌舵 (Driver)
         if self.training and gt_entropy is not None:
-            # ★★★ 训练模式 ★★★
             weights_teacher = self.router(gt_entropy)
             weights_driver = weights_teacher
-            aux_loss = F.mse_loss(weights_student, weights_teacher.detach())
+            distill_loss = F.mse_loss(weights_student, weights_teacher.detach())
+            aux_loss = aux_loss + distill_loss
         else:
-            # ★★★ 推理/验证模式 ★★★
             weights_driver = weights_student
-            aux_loss = torch.tensor(0.0, device=device)
 
-        # --- Phase 2: 基于掌舵者的权重进行后续操作 ---
-
-        # 3. HyperNet 决定阈值
+        # --- Phase 2: HyperNet ---
         threshold = self.hypernet(weights_driver)  # [B, 1]
 
-        # 4. 生成软掩码
-        soft_mask = torch.sigmoid((weights_driver.view(B, -1) - threshold) * 50.0)
+        # 限制温度系数，防止梯度爆炸
+        temp = torch.clamp(self.temperature, min=1.0, max=100.0)
+        soft_mask = torch.sigmoid((weights_driver.view(B, -1) - threshold) * temp)
+
+        # ★★★ 修复点 3: 范围稀疏度正则化 (Range Sparsity Regularization) ★★★
+        # 逻辑：给模型 5%~40% 的自由空间。在这个区间内，Loss 为 0。
+        if self.training:
+            current_sparsity = soft_mask.mean()
+
+            # 设定安全范围
+            min_s = 0.05  # 下限 5%：防止模型偷懒全不选，导致 Mixer 没训练
+            max_s = 0.80  # 上限 40%：防止显存爆炸
+
+            sparsity_loss = 0.0
+
+            if current_sparsity < min_s:
+                # 选太少了 -> 惩罚 (逼它多选点)
+                sparsity_loss = (min_s - current_sparsity) ** 2
+            elif current_sparsity > max_s:
+                # 选太多了 -> 惩罚 (逼它少选点)
+                sparsity_loss = (current_sparsity - max_s) ** 2
+
+            # 如果在 [0.05, 0.40] 之间，sparsity_loss 就是 0，完全自由！
+
+            # 放大权重，让它对边界敏感
+            aux_loss = aux_loss + sparsity_loss * 8
 
         # 5. 重构画布
         reconstructed_canvas = torch.zeros((B, C, N), device=device)
@@ -170,8 +190,6 @@ class DynamicFusionModule(nn.Module):
             reconstructed_canvas[b] = final_flat_b.transpose(0, 1)
 
             # --- 可视化 ---
-            # 修改：仅在训练时采样可视化，或者你也可以保留验证集的可视化
-            # 这里逻辑是：每200步保存一次，自动根据 training 状态分文件夹
             if self.vis_count % 200 == 0 and b == 0:
                 self._visualize_reconstruction(
                     student_logits[b],
@@ -187,7 +205,6 @@ class DynamicFusionModule(nn.Module):
 
     def _visualize_reconstruction(self, logits, active_indices, threshold_val, H, W, device):
         try:
-            # 判断当前是训练还是验证，决定存到哪个文件夹
             if self.training:
                 mode = "train"
                 save_dir = self.vis_train_dir
@@ -201,7 +218,7 @@ class DynamicFusionModule(nn.Module):
             mask = mask.view(H, W).cpu().numpy()
 
             pixel_save_path = os.path.join(
-                save_dir,  # <--- 使用对应的子目录
+                save_dir,
                 f"{mode}_step{self.vis_count}_ch{self.dim}_pixels.png"
             )
             cv2.imwrite(pixel_save_path, (mask * 255).astype(np.uint8))
@@ -216,7 +233,7 @@ class DynamicFusionModule(nn.Module):
             plt.tight_layout(pad=0)
 
             entropy_save_path = os.path.join(
-                save_dir,  # <--- 使用对应的子目录
+                save_dir,
                 f"{mode}_step{self.vis_count}_ch{self.dim}_entropy.png"
             )
             plt.savefig(entropy_save_path, dpi=100, bbox_inches='tight')

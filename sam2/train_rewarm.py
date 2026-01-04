@@ -26,7 +26,7 @@ from sam2.modeling.multitask_sam_serial import MultiTaskSerialModel
 from utils.custom_losses import BinarySUMLoss, StandardSegLoss
 
 # --- 配置区域 ---
-EXP_NAME = "map_path_correct_12_31"
+EXP_NAME = "visual_correct_1_4"
 
 # 路径配置
 ENTROPY_ROOT = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/entropy_maps"
@@ -43,8 +43,8 @@ VAL_DIRS = {
 }
 UNCERTAINTY_ROOT_TRAIN = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/uncertainty_map/train"
 
-SAM_CFG = "configs/sam2.1/sam2.1_hiera_s.yaml"
-SAM_CKPT = "../checkpoints/sam2.1_hiera_small.pt"
+SAM_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+SAM_CKPT = "../checkpoints/sam2.1_hiera_tiny.pt"
 
 BATCH_SIZE = 2
 ACCUM_STEPS = 8
