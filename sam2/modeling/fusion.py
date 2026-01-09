@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 
 
 # --- 1. Agent (学生 / 辅助预测器) ---
-# 作用: 测试时替代 Router，独立判断。
 class SamplingAgent(nn.Module):
     def __init__(self, in_channels, hidden_dim=512):
         super().__init__()
@@ -16,7 +15,6 @@ class SamplingAgent(nn.Module):
             nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=1),
             nn.SiLU(inplace=True),
             nn.Conv2d(hidden_dim, 1, kernel_size=1)
-            # 输出 Logits，不加 Sigmoid
         )
 
     def forward(self, f_ir, f_vis):
@@ -26,12 +24,10 @@ class SamplingAgent(nn.Module):
 
 
 # --- 2. Router (老师) ---
-# ★★★ 结构已改为线性层 (1x1 Conv) ★★★
-# 作用: 训练时根据熵图打分。
 class Router(nn.Module):
     def __init__(self, in_channels=1):
         super().__init__()
-        # 1x1 卷积等价于像素级的 Linear Layer (Wx + b)
+        # 1x1 卷积等价于像素级的 Linear Layer
         self.net = nn.Conv2d(in_channels, 1, kernel_size=1)
 
         # 初始化
@@ -43,26 +39,19 @@ class Router(nn.Module):
 
 
 # --- 3. HyperNetwork (动态阈值器) ---
-# 作用: 根据全局双模态特征，决定阈值。
 class HyperNetwork(nn.Module):
     def __init__(self, in_dim, hidden_dim=512):
         super().__init__()
-        # in_dim = dim * 2
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Linear(hidden_dim, 1)
-            # 输出 Logits 阈值
         )
 
     def forward(self, f_ir, f_vis):
-        # 分别计算全局均值，保留模态独立性
         ctx_ir = f_ir.mean(dim=(2, 3))
         ctx_vis = f_vis.mean(dim=(2, 3))
-
-        # 拼接 (Concatenation)
         global_ctx = torch.cat([ctx_ir, ctx_vis], dim=1)
-
         threshold = self.mlp(global_ctx)
         return threshold  # [B, 1]
 
@@ -76,13 +65,13 @@ class MixerBlock(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
         )
-        # 零初始化
         nn.init.constant_(self.ffn[-1].weight, 0)
         nn.init.constant_(self.ffn[-1].bias, 0)
 
     def forward(self, x):
         x_norm = self.norm(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        # 显存优化
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
         x = x + attn_out
         x = x + self.ffn(self.norm(x))
         return x
@@ -93,20 +82,29 @@ class DynamicFusionModule(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
+
+        # --- [修改 1] 根据通道数推断 Stage 名称，用于文件名区分 ---
+        # Hiera-Tiny 典型通道配置: 96, 192, 384, 768
+        if dim == 96:
+            self.stage_name = "Stage1"
+        elif dim == 192:
+            self.stage_name = "Stage2"
+        elif dim == 384:
+            self.stage_name = "Stage3"
+        elif dim == 768:
+            self.stage_name = "Stage4"
+        else:
+            self.stage_name = f"Dim{dim}"
+
         self.agent = SamplingAgent(dim)
-
-        # 线性 Router
         self.router = Router(in_channels=1)
-
-        # HyperNet 输入翻倍
         self.hypernet = HyperNetwork(in_dim=dim * 2)
-
         self.mixer_ir = MixerBlock(dim)
         self.mixer_vis = MixerBlock(dim)
 
-        # 可视化配置
+        # --- [修改 2] 更新可视化根目录为 vis_1_9 ---
         self.vis_count = 0
-        self.vis_root = "vis_reconstruction"
+        self.vis_root = "vis_1_9"  # 修改文件夹名
         self.vis_train_dir = os.path.join(self.vis_root, "train")
         self.vis_val_dir = os.path.join(self.vis_root, "val")
         os.makedirs(self.vis_train_dir, exist_ok=True)
@@ -117,71 +115,52 @@ class DynamicFusionModule(nn.Module):
         N = H * W
         device = f_ir.device
 
-        # 0. 基础底座 (Background)
-        # 未选中的点保留此值 (Residual Connection)
+        # 0. 基础底座
         base_feat_sum = f_ir + f_vis
 
         # --- Phase 1: Agent 预测 ---
         agent_logits = self.agent(f_ir, f_vis)
         aux_loss = torch.tensor(0.0, device=device)
-
-        # 最终用于计算的 mask (带梯度)
         selection_mask_ste = None
-
-        # 用于可视化的变量
         hard_mask_vis = None
 
         # --- Phase 2: 生成筛选标准 ---
         if self.training and gt_entropy is not None:
             # === 训练模式 ===
-
-            # 1. Router 打分 (Pixel-level)
             driver_logits = self.router(gt_entropy)
-
-            # 2. HyperNet 定阈值 (Image-level)
             threshold = self.hypernet(f_ir, f_vis).view(B, 1, 1, 1)
 
-            # 3. 比较: Logits - Threshold
             diff = driver_logits - threshold
 
-            # 4. 硬掩码 (Forward用)
+            # 硬掩码 (Forward)
             hard_mask = (diff > 0).float()
-            hard_mask_vis = hard_mask  # 存下来画图用
+            hard_mask_vis = hard_mask
 
-            # 5. 软掩码 (Backward用)
-            # 温度系数 5.0 可调，越大梯度越陡
+            # 软掩码 (Backward)
             soft_mask = torch.sigmoid(diff * 5.0)
 
-            # ★★★ STE (直通估计器) ★★★
-            # 实现了: 前向硬筛选，反向传梯度给 Router 和 HyperNet
+            # STE
             selection_mask_ste = hard_mask + (soft_mask - soft_mask.detach())
 
-            # 6. Agent 模仿 Loss
+            # Agent Loss
             aux_loss = F.binary_cross_entropy_with_logits(agent_logits, hard_mask.detach())
 
         else:
             # === 推理模式 ===
-            # Agent 独立判断，硬截断
             selection_mask_ste = (agent_logits > 0).float()
-            hard_mask_vis = None  # 推理时没有 GT mask
+            hard_mask_vis = None
 
-        # --- Phase 3: 稀疏精修 (Sparse Processing) ---
-
-        flat_ir = f_ir.flatten(2).transpose(1, 2)  # [B, N, C]
+        # --- Phase 3: 稀疏精修 ---
+        flat_ir = f_ir.flatten(2).transpose(1, 2)
         flat_vis = f_vis.flatten(2).transpose(1, 2)
-
-        # 初始画布 = 基础底座 (未选中点保留原样)
         final_canvas = base_feat_sum.flatten(2).transpose(1, 2).clone()
-
-        # 将 Mask 拉平
-        mask_flat = selection_mask_ste.flatten(2).transpose(1, 2)  # [B, N, 1]
+        mask_flat = selection_mask_ste.flatten(2).transpose(1, 2)
 
         for b in range(B):
-            # 1. 获取索引 (用于 Gather 省算力)
-            # 以前向传播的硬值 (0或1) 为准
+            # 1. 获取索引
             indices = torch.nonzero(mask_flat[b, :, 0] > 0.5).squeeze(1)
 
-            # 兜底机制 (防止空选导致报错)
+            # 兜底机制
             if indices.numel() < 64:
                 if self.training and gt_entropy is not None:
                     logits_for_topk = driver_logits[b].flatten()
@@ -189,40 +168,37 @@ class DynamicFusionModule(nn.Module):
                     logits_for_topk = agent_logits[b].flatten()
                 _, indices = torch.topk(logits_for_topk, 64)
 
-            # 2. 提取特征
+            # 2. 提取
             sel_ir = flat_ir[b, indices].unsqueeze(0)
             sel_vis = flat_vis[b, indices].unsqueeze(0)
 
-            # 3. 分别精修
+            # 3. 精修
             ref_ir = self.mixer_ir(sel_ir)
             ref_vis = self.mixer_vis(sel_vis)
 
-            # 4. ★★★ 梯度桥接 ★★★
-            # 乘上 STE Mask (数值为1.0，但带着梯度)
+            # 4. 梯度桥接
             m_ste = mask_flat[b, indices].view(1, -1, 1)
 
-            # 5. 纯相加融合 (Selected Points)
-            # 选中点 = 精修IR + 精修Vis
+            # 5. 融合
             refined_sum = (ref_ir + ref_vis) * m_ste
 
-            # 6. 回填 (Replacement)
-            # 选中点被替换，未选中点保持 base_feat_sum
+            # 6. 回填
             final_canvas[b, indices] = refined_sum.squeeze(0)
 
-        # --- 可视化 (训练时对比三者) ---
-        if self.vis_count % 200 == 0:
-            # 取 batch 中第一张图
+        # --- [修改 3] 可视化逻辑修改 ---
+        # 改为每 100 步保存一次
+        if self.vis_count % 100 == 0:
             student_mask_vis = (agent_logits[0] > 0).float()
-
             self._visualize_comparison(
                 gt_entropy[0] if gt_entropy is not None else None,
                 hard_mask_vis[0] if hard_mask_vis is not None else None,
                 student_mask_vis,
                 H, W, device
             )
-            self.vis_count += 1
 
-        # 恢复维度
+        # [关键修复] 计数器必须在 if 外面增加，否则会卡在 1
+        self.vis_count += 1
+
         f_final = final_canvas.transpose(1, 2).view(B, C, H, W)
         return f_final, aux_loss
 
@@ -230,10 +206,9 @@ class DynamicFusionModule(nn.Module):
         try:
             mode = "train" if self.training else "val"
             save_dir = self.vis_train_dir if self.training else self.vis_val_dir
-
             vis_list = []
 
-            # 1. 熵加图 (Heatmap)
+            # 1. 熵加图 (Heatmap) - Router输入
             if entropy_map is not None:
                 e_data = entropy_map.squeeze().detach().cpu().numpy()
                 e_min, e_max = e_data.min(), e_data.max()
@@ -241,18 +216,22 @@ class DynamicFusionModule(nn.Module):
                     e_norm = (e_data - e_min) / (e_max - e_min)
                 else:
                     e_norm = e_data
-                e_img = (e_norm * 255).astype(np.uint8)
-                e_color = cv2.applyColorMap(e_img, cv2.COLORMAP_INFERNO)
+
+                # BGR: White (255,255,255) -> Red (0,0,255)
+                e_img_b = (255 * (1 - e_norm)).astype(np.uint8)
+                e_img_g = (255 * (1 - e_norm)).astype(np.uint8)
+                e_img_r = np.full_like(e_norm, 255, dtype=np.uint8)
+                e_color = cv2.merge([e_img_b, e_img_g, e_img_r])
                 vis_list.append(e_color)
 
-            # 2. 老师选择 (BW)
+            # 2. 老师/超网络选择 (BW) - GT Mask
             if teacher_mask is not None:
                 t_data = teacher_mask.squeeze().detach().cpu().numpy()
                 t_img = (t_data * 255).astype(np.uint8)
                 t_img_bgr = cv2.cvtColor(t_img, cv2.COLOR_GRAY2BGR)
                 vis_list.append(t_img_bgr)
 
-            # 3. 学生选择 (BW)
+            # 3. 学生/Agent选择 (BW) - Pred Mask
             if student_mask is not None:
                 s_data = student_mask.squeeze().detach().cpu().numpy()
                 s_img = (s_data * 255).astype(np.uint8)
@@ -260,9 +239,12 @@ class DynamicFusionModule(nn.Module):
                 vis_list.append(s_img_bgr)
 
             if vis_list:
-                # 水平拼接
                 combined_img = np.hstack(vis_list)
-                cv2.imwrite(os.path.join(save_dir, f"{mode}_step{self.vis_count}_compare.png"), combined_img)
+                # --- [修改 4] 命名包含 Stage 和 Step ---
+                # 格式: {mode}_step{count}_{StageName}_compare.png
+                # 例如: train_step100_Stage1_compare.png
+                filename = f"{mode}_step{self.vis_count}_{self.stage_name}_compare.png"
+                cv2.imwrite(os.path.join(save_dir, filename), combined_img)
 
         except Exception as e:
             print(f"Vis error: {e}")
