@@ -16,7 +16,7 @@ except ImportError:
 
 # ================= 配置区域 =================
 DATASET_ROOT = Path("/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS")
-OUTPUT_ROOT = DATASET_ROOT / "entropy_maps"
+OUTPUT_ROOT = DATASET_ROOT / "entropy_maps_add"
 
 # 4个阶段的下采样倍率
 TOKEN_SIZES = {'stage1': 4, 'stage2': 8, 'stage3': 16, 'stage4': 32}
@@ -170,7 +170,7 @@ def process_subset(subset_name, mask_generator):
             for stage_name, token_size in TOKEN_SIZES.items():
                 map_vis = create_entropy_map(heatmap_vis, token_size)
                 map_ir = create_entropy_map(heatmap_ir, token_size)
-                diff_map = map_ir - map_vis
+                diff_map = map_ir + map_vis
                 np.save(output_dirs[stage_name] / save_name_npy, diff_map)
 
             tqdm.write(f"红外图-{fname}，可见光-{fname}，差异熵图-{save_name_npy}")

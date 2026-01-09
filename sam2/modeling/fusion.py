@@ -7,50 +7,63 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-# --- 1. Agent (学生: 负责在测试时模仿老师) ---
+# --- 1. Agent (学生 / 辅助预测器) ---
+# 作用: 测试时替代 Router，独立判断。
 class SamplingAgent(nn.Module):
     def __init__(self, in_channels, hidden_dim=512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.SiLU(inplace=True),
             nn.Conv2d(hidden_dim, 1, kernel_size=1)
+            # 输出 Logits，不加 Sigmoid
         )
 
     def forward(self, f_ir, f_vis):
         x = torch.cat([f_ir, f_vis], dim=1)
         logits = self.net(x)
-        return torch.sigmoid(logits), logits
+        return logits
 
 
-# --- 2. Router (老师: 训练时利用 GT 指导全场) ---
+# --- 2. Router (老师) ---
+# ★★★ 结构已改为线性层 (1x1 Conv) ★★★
+# 作用: 训练时根据熵图打分。
 class Router(nn.Module):
     def __init__(self, in_channels=1):
         super().__init__()
+        # 1x1 卷积等价于像素级的 Linear Layer (Wx + b)
         self.net = nn.Conv2d(in_channels, 1, kernel_size=1)
+
+        # 初始化
         nn.init.xavier_normal_(self.net.weight, gain=0.01)
         nn.init.constant_(self.net.bias, 0.0)
 
     def forward(self, entropy_map):
-        return torch.sigmoid(self.net(entropy_map))
+        return self.net(entropy_map)
 
 
 # --- 3. HyperNetwork (动态阈值器) ---
+# 作用: 根据全局双模态特征，决定阈值。
 class HyperNetwork(nn.Module):
-    def __init__(self, in_dim=1):
+    def __init__(self, in_dim, hidden_dim=512):
         super().__init__()
+        # in_dim = dim * 2
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-            nn.Sigmoid()
+            nn.Linear(in_dim, hidden_dim),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(hidden_dim, 1)
+            # 输出 Logits 阈值
         )
 
-    def forward(self, weights):
-        # 统计全局信息
-        global_stat = weights.mean(dim=(2, 3)).view(-1, 1)
-        threshold = self.mlp(global_stat)
+    def forward(self, f_ir, f_vis):
+        # 分别计算全局均值，保留模态独立性
+        ctx_ir = f_ir.mean(dim=(2, 3))
+        ctx_vis = f_vis.mean(dim=(2, 3))
+
+        # 拼接 (Concatenation)
+        global_ctx = torch.cat([ctx_ir, ctx_vis], dim=1)
+
+        threshold = self.mlp(global_ctx)
         return threshold  # [B, 1]
 
 
@@ -63,6 +76,9 @@ class MixerBlock(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
         )
+        # 零初始化
+        nn.init.constant_(self.ffn[-1].weight, 0)
+        nn.init.constant_(self.ffn[-1].bias, 0)
 
     def forward(self, x):
         x_norm = self.norm(x)
@@ -72,27 +88,23 @@ class MixerBlock(nn.Module):
         return x
 
 
-# --- 5. DynamicFusionModule ---
+# --- 5. DynamicFusionModule (主模块) ---
 class DynamicFusionModule(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
         self.agent = SamplingAgent(dim)
-        self.router = Router()
-        self.hypernet = HyperNetwork()
+
+        # 线性 Router
+        self.router = Router(in_channels=1)
+
+        # HyperNet 输入翻倍
+        self.hypernet = HyperNetwork(in_dim=dim * 2)
 
         self.mixer_ir = MixerBlock(dim)
         self.mixer_vis = MixerBlock(dim)
 
-        self.highlight_scale = nn.Parameter(torch.tensor(1.0))
-
-        # ★★★ 修复点 1: 可学习的温度系数，初始化为 20.0 ★★★
-        self.temperature = nn.Parameter(torch.ones(1) * 20.0)
-
-        # ★★★ 修改: 不再需要 target_sparsity 这个固定值了 ★★★
-        # self.target_sparsity = 0.2  <-- 删掉或忽略
-
-        # --- 可视化配置 ---
+        # 可视化配置
         self.vis_count = 0
         self.vis_root = "vis_reconstruction"
         self.vis_train_dir = os.path.join(self.vis_root, "train")
@@ -105,140 +117,152 @@ class DynamicFusionModule(nn.Module):
         N = H * W
         device = f_ir.device
 
-        bg_context_feat = f_ir + f_vis
+        # 0. 基础底座 (Background)
+        # 未选中的点保留此值 (Residual Connection)
+        base_feat_sum = f_ir + f_vis
 
-        # --- Phase 1: 角色分配 ---
-        weights_student, student_logits = self.agent(f_ir, f_vis)
+        # --- Phase 1: Agent 预测 ---
+        agent_logits = self.agent(f_ir, f_vis)
         aux_loss = torch.tensor(0.0, device=device)
 
+        # 最终用于计算的 mask (带梯度)
+        selection_mask_ste = None
+
+        # 用于可视化的变量
+        hard_mask_vis = None
+
+        # --- Phase 2: 生成筛选标准 ---
         if self.training and gt_entropy is not None:
-            weights_teacher = self.router(gt_entropy)
-            weights_driver = weights_teacher
-            distill_loss = F.mse_loss(weights_student, weights_teacher.detach())
-            aux_loss = aux_loss + distill_loss
+            # === 训练模式 ===
+
+            # 1. Router 打分 (Pixel-level)
+            driver_logits = self.router(gt_entropy)
+
+            # 2. HyperNet 定阈值 (Image-level)
+            threshold = self.hypernet(f_ir, f_vis).view(B, 1, 1, 1)
+
+            # 3. 比较: Logits - Threshold
+            diff = driver_logits - threshold
+
+            # 4. 硬掩码 (Forward用)
+            hard_mask = (diff > 0).float()
+            hard_mask_vis = hard_mask  # 存下来画图用
+
+            # 5. 软掩码 (Backward用)
+            # 温度系数 5.0 可调，越大梯度越陡
+            soft_mask = torch.sigmoid(diff * 5.0)
+
+            # ★★★ STE (直通估计器) ★★★
+            # 实现了: 前向硬筛选，反向传梯度给 Router 和 HyperNet
+            selection_mask_ste = hard_mask + (soft_mask - soft_mask.detach())
+
+            # 6. Agent 模仿 Loss
+            aux_loss = F.binary_cross_entropy_with_logits(agent_logits, hard_mask.detach())
+
         else:
-            weights_driver = weights_student
+            # === 推理模式 ===
+            # Agent 独立判断，硬截断
+            selection_mask_ste = (agent_logits > 0).float()
+            hard_mask_vis = None  # 推理时没有 GT mask
 
-        # --- Phase 2: HyperNet ---
-        threshold = self.hypernet(weights_driver)  # [B, 1]
+        # --- Phase 3: 稀疏精修 (Sparse Processing) ---
 
-        # 限制温度系数，防止梯度爆炸
-        temp = torch.clamp(self.temperature, min=1.0, max=100.0)
-        soft_mask = torch.sigmoid((weights_driver.view(B, -1) - threshold) * temp)
+        flat_ir = f_ir.flatten(2).transpose(1, 2)  # [B, N, C]
+        flat_vis = f_vis.flatten(2).transpose(1, 2)
 
-        # ★★★ 修复点 3: 范围稀疏度正则化 (Range Sparsity Regularization) ★★★
-        # 逻辑：给模型 5%~40% 的自由空间。在这个区间内，Loss 为 0。
-        if self.training:
-            current_sparsity = soft_mask.mean()
+        # 初始画布 = 基础底座 (未选中点保留原样)
+        final_canvas = base_feat_sum.flatten(2).transpose(1, 2).clone()
 
-            # 设定安全范围
-            min_s = 0.05  # 下限 5%：防止模型偷懒全不选，导致 Mixer 没训练
-            max_s = 0.80  # 上限 40%：防止显存爆炸
-
-            sparsity_loss = 0.0
-
-            if current_sparsity < min_s:
-                # 选太少了 -> 惩罚 (逼它多选点)
-                sparsity_loss = (min_s - current_sparsity) ** 2
-            elif current_sparsity > max_s:
-                # 选太多了 -> 惩罚 (逼它少选点)
-                sparsity_loss = (current_sparsity - max_s) ** 2
-
-            # 如果在 [0.05, 0.40] 之间，sparsity_loss 就是 0，完全自由！
-
-            # 放大权重，让它对边界敏感
-            aux_loss = aux_loss + sparsity_loss * 8
-
-        # 5. 重构画布
-        reconstructed_canvas = torch.zeros((B, C, N), device=device)
+        # 将 Mask 拉平
+        mask_flat = selection_mask_ste.flatten(2).transpose(1, 2)  # [B, N, 1]
 
         for b in range(B):
-            # --- Step A: 稀疏索引 ---
-            flat_mask_b = soft_mask[b]
-            active_indices = torch.nonzero(flat_mask_b > 0.5).squeeze(1)
+            # 1. 获取索引 (用于 Gather 省算力)
+            # 以前向传播的硬值 (0或1) 为准
+            indices = torch.nonzero(mask_flat[b, :, 0] > 0.5).squeeze(1)
 
-            if active_indices.numel() < 64:
-                _, active_indices = torch.topk(weights_driver[b].flatten(), 64)
+            # 兜底机制 (防止空选导致报错)
+            if indices.numel() < 64:
+                if self.training and gt_entropy is not None:
+                    logits_for_topk = driver_logits[b].flatten()
+                else:
+                    logits_for_topk = agent_logits[b].flatten()
+                _, indices = torch.topk(logits_for_topk, 64)
 
-            # --- Step B: 提取特征 ---
-            idx_expanded = active_indices.unsqueeze(1).expand(-1, C)
-            flat_ir_b = f_ir[b].flatten(1).transpose(0, 1)
-            flat_vis_b = f_vis[b].flatten(1).transpose(0, 1)
-            selected_ir = torch.gather(flat_ir_b, 0, idx_expanded).unsqueeze(0)
-            selected_vis = torch.gather(flat_vis_b, 0, idx_expanded).unsqueeze(0)
+            # 2. 提取特征
+            sel_ir = flat_ir[b, indices].unsqueeze(0)
+            sel_vis = flat_vis[b, indices].unsqueeze(0)
 
-            # 提取软权重
-            mask_selected = torch.gather(flat_mask_b, 0, active_indices).view(1, -1, 1)
-            w_driver_selected = torch.gather(weights_driver[b].flatten(), 0, active_indices).view(1, -1, 1)
+            # 3. 分别精修
+            ref_ir = self.mixer_ir(sel_ir)
+            ref_vis = self.mixer_vis(sel_vis)
 
-            # --- Step C: Mixer 精修 ---
-            refined_ir = self.mixer_ir(selected_ir)
-            refined_vis = self.mixer_vis(selected_vis)
+            # 4. ★★★ 梯度桥接 ★★★
+            # 乘上 STE Mask (数值为1.0，但带着梯度)
+            m_ste = mask_flat[b, indices].view(1, -1, 1)
 
-            # --- Step D: 融合 ---
-            fusion_content = refined_ir * w_driver_selected + refined_vis * (1 - w_driver_selected)
-            mixer_delta = fusion_content * mask_selected
+            # 5. 纯相加融合 (Selected Points)
+            # 选中点 = 精修IR + 精修Vis
+            refined_sum = (ref_ir + ref_vis) * m_ste
 
-            # --- Step E: 回填 ---
-            flat_base_b = bg_context_feat[b].flatten(1).transpose(0, 1)
-            base_selected = torch.gather(flat_base_b, 0, idx_expanded).unsqueeze(0)
-            modulation = 1.0 + mask_selected * self.highlight_scale
-            final_edge_feat = (base_selected + mixer_delta) * modulation
+            # 6. 回填 (Replacement)
+            # 选中点被替换，未选中点保持 base_feat_sum
+            final_canvas[b, indices] = refined_sum.squeeze(0)
 
-            final_flat_b = flat_base_b.clone()
-            final_flat_b.scatter_(0, idx_expanded, final_edge_feat.squeeze(0))
-            reconstructed_canvas[b] = final_flat_b.transpose(0, 1)
+        # --- 可视化 (训练时对比三者) ---
+        if self.vis_count % 200 == 0:
+            # 取 batch 中第一张图
+            student_mask_vis = (agent_logits[0] > 0).float()
 
-            # --- 可视化 ---
-            if self.vis_count % 200 == 0 and b == 0:
-                self._visualize_reconstruction(
-                    student_logits[b],
-                    active_indices,
-                    threshold[b],
-                    H, W, device
-                )
+            self._visualize_comparison(
+                gt_entropy[0] if gt_entropy is not None else None,
+                hard_mask_vis[0] if hard_mask_vis is not None else None,
+                student_mask_vis,
+                H, W, device
+            )
+            self.vis_count += 1
 
-            if b == 0: self.vis_count += 1
-
-        f_final = reconstructed_canvas.view(B, C, H, W)
+        # 恢复维度
+        f_final = final_canvas.transpose(1, 2).view(B, C, H, W)
         return f_final, aux_loss
 
-    def _visualize_reconstruction(self, logits, active_indices, threshold_val, H, W, device):
+    def _visualize_comparison(self, entropy_map, teacher_mask, student_mask, H, W, device):
         try:
-            if self.training:
-                mode = "train"
-                save_dir = self.vis_train_dir
-            else:
-                mode = "val"
-                save_dir = self.vis_val_dir
+            mode = "train" if self.training else "val"
+            save_dir = self.vis_train_dir if self.training else self.vis_val_dir
 
-            # --- 1. 选中像素图 ---
-            mask = torch.zeros((H * W), device=device)
-            mask.scatter_(0, active_indices, 1.0)
-            mask = mask.view(H, W).cpu().numpy()
+            vis_list = []
 
-            pixel_save_path = os.path.join(
-                save_dir,
-                f"{mode}_step{self.vis_count}_ch{self.dim}_pixels.png"
-            )
-            cv2.imwrite(pixel_save_path, (mask * 255).astype(np.uint8))
+            # 1. 熵加图 (Heatmap)
+            if entropy_map is not None:
+                e_data = entropy_map.squeeze().detach().cpu().numpy()
+                e_min, e_max = e_data.min(), e_data.max()
+                if e_max - e_min > 1e-5:
+                    e_norm = (e_data - e_min) / (e_max - e_min)
+                else:
+                    e_norm = e_data
+                e_img = (e_norm * 255).astype(np.uint8)
+                e_color = cv2.applyColorMap(e_img, cv2.COLORMAP_INFERNO)
+                vis_list.append(e_color)
 
-            # --- 2. 熵差图 ---
-            entropy_data = logits.squeeze().detach().cpu().numpy()
-            limit = max(abs(entropy_data.min()), abs(entropy_data.max()), 1e-4)
+            # 2. 老师选择 (BW)
+            if teacher_mask is not None:
+                t_data = teacher_mask.squeeze().detach().cpu().numpy()
+                t_img = (t_data * 255).astype(np.uint8)
+                t_img_bgr = cv2.cvtColor(t_img, cv2.COLOR_GRAY2BGR)
+                vis_list.append(t_img_bgr)
 
-            plt.figure(figsize=(6, 6))
-            plt.imshow(entropy_data, cmap='bwr', vmin=-limit, vmax=limit)
-            plt.axis('off')
-            plt.tight_layout(pad=0)
+            # 3. 学生选择 (BW)
+            if student_mask is not None:
+                s_data = student_mask.squeeze().detach().cpu().numpy()
+                s_img = (s_data * 255).astype(np.uint8)
+                s_img_bgr = cv2.cvtColor(s_img, cv2.COLOR_GRAY2BGR)
+                vis_list.append(s_img_bgr)
 
-            entropy_save_path = os.path.join(
-                save_dir,
-                f"{mode}_step{self.vis_count}_ch{self.dim}_entropy.png"
-            )
-            plt.savefig(entropy_save_path, dpi=100, bbox_inches='tight')
-            plt.close()
+            if vis_list:
+                # 水平拼接
+                combined_img = np.hstack(vis_list)
+                cv2.imwrite(os.path.join(save_dir, f"{mode}_step{self.vis_count}_compare.png"), combined_img)
 
         except Exception as e:
-            print(f"Visualization failed: {e}")
-            pass
+            print(f"Vis error: {e}")

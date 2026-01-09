@@ -1,5 +1,6 @@
 import os
 import warnings
+import sys
 
 # 过滤烦人的 FutureWarning
 warnings.filterwarnings("ignore")
@@ -92,7 +93,7 @@ class SegEvaluator:
         return {"mIoU": miou, "PA": pixel_acc}
 
 
-# --- Dataset (安静版：只做初始化检查) ---
+# --- Dataset (增强版：包含详细错误检查) ---
 class MSRSDataset(Dataset):
     def __init__(self, dirs, uncertainty_root=None, entropy_root=None, is_train=True):
         self.vis = dirs['vi']
@@ -124,8 +125,15 @@ class MSRSDataset(Dataset):
                     path_ir = os.path.join(self.uncertainty_root, 'ir', npy_name)
                     if not (os.path.exists(path_vi) and os.path.exists(path_ir)): continue
 
+                # ★★★ 修改 1: 检查所有 Stage 的熵图是否存在 ★★★
                 if self.entropy_dirs:
-                    if not os.path.exists(os.path.join(self.entropy_dirs['stage1'], npy_name)): continue
+                    missing_stage = False
+                    for stage in ['stage1', 'stage2', 'stage3', 'stage4']:
+                        if not os.path.exists(os.path.join(self.entropy_dirs[stage], npy_name)):
+                            missing_stage = True
+                            # print(f"Missing {stage} entropy map for {f}") # 调试用
+                            break
+                    if missing_stage: continue
 
             self.files.append(f)
 
@@ -160,9 +168,27 @@ class MSRSDataset(Dataset):
         if self.is_train and self.entropy_dirs:
             npy_name = n.replace('.png', '.npy')
             for stage in ['stage1', 'stage2', 'stage3', 'stage4']:
-                em = torch.from_numpy(np.load(os.path.join(self.entropy_dirs[stage], npy_name)).astype(np.float32))
-                if em.ndim == 2: em = em.unsqueeze(0)
-                entropy_maps_list.append(em)
+                target_path = os.path.join(self.entropy_dirs[stage], npy_name)
+                # ★★★ 修改 2: 增加详细的错误捕获与路径打印 ★★★
+                try:
+                    if not os.path.exists(target_path):
+                        raise FileNotFoundError(f"File does not exist: {target_path}")
+
+                    # 尝试加载
+                    em_numpy = np.load(target_path).astype(np.float32)
+                    em = torch.from_numpy(em_numpy)
+
+                    if em.ndim == 2: em = em.unsqueeze(0)
+                    entropy_maps_list.append(em)
+
+                except Exception as e:
+                    print(f"\n[💥 Error Loading Entropy Map]")
+                    print(f"  ├─ Image Name: {n}")
+                    print(f"  ├─ Stage: {stage}")
+                    print(f"  ├─ Target Path: {target_path}")
+                    print(f"  └─ Exception: {e}")
+                    # 抛出异常以停止训练，防止数据错位
+                    raise e
 
         if self.is_train and torch.rand(1).item() > 0.5:
             v_img = TF.hflip(v_img)
@@ -207,7 +233,7 @@ def train():
         {'params': router_params, 'lr': 0.001}
     ], weight_decay=1e-4)
 
-    # ★★★ 修改点：eta_min 调整为 1e-5 (更激进) ★★★
+    # eta_min 调整为 1e-5
     scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS, eta_min=1e-5)
     scaler = GradScaler()
     crit_seg = StandardSegLoss(NUM_CLASSES)
@@ -222,21 +248,18 @@ def train():
         batch_size=1, shuffle=False, num_workers=4, worker_init_fn=worker_init_fn
     )
 
-    # 初始化 Evaluator (修复之前的报错)
     evaluator = SegEvaluator(NUM_CLASSES)
     best_miou = 0.0
 
     for ep in range(EPOCHS):
         model.train()
 
-        # ★★★ 修改点：打印当前 LR ★★★
         curr_lr = opt.param_groups[0]['lr']
         print(f"\n=== Epoch {ep + 1}/{EPOCHS} | LR: {curr_lr:.2e} ===")
 
         pbar = tqdm(train_dl, desc="Train")
         opt.zero_grad()
 
-        # 统计4个 Loss
         metrics = {'Seg': 0.0, 'Aux': 0.0, 'Fus': 0.0, 'Moe': 0.0}
 
         for step, (v, i_img, l, s_vi, s_ir, entropy_maps) in enumerate(pbar):
@@ -245,19 +268,24 @@ def train():
             e_maps_cuda = [em.cuda() for em in entropy_maps]
 
             with autocast():
-                seg_out, sam_preds, moe_loss, fusion_loss = model(v, i_img, l, e_maps_cuda)
+                # ★★★ 修改 3: 显式使用关键字参数，确保 gt_entropy_maps 正确传入 ★★★
+                seg_out, sam_preds, moe_loss, fusion_loss = model(
+                    vis=v,
+                    ir=i_img,
+                    gt_semantic=l,
+                    gt_entropy_maps=e_maps_cuda
+                )
 
                 l_main = crit_seg(seg_out, l)
                 l_rgb = crit_sam(sam_preds['rgb_s4'], l, s_vi)
                 l_ir = crit_sam(sam_preds['ir_s4'], l, s_ir)
                 l_aux = (l_rgb + l_ir) / 2.0
 
-                loss =  l_main + 0.5 * l_aux + 0.5 * fusion_loss + 0.05 * moe_loss
+                loss = l_main + 0.5 * l_aux + 0.5 * fusion_loss + 0.05 * moe_loss
                 loss = loss / ACCUM_STEPS
 
             scaler.scale(loss).backward()
 
-            # 记录详细 Loss
             metrics['Seg'] += l_main.item()
             metrics['Aux'] += l_aux.item()
             metrics['Fus'] += fusion_loss.item()
@@ -270,7 +298,6 @@ def train():
                 scaler.update()
                 opt.zero_grad()
 
-            # ★★★ 修改点：进度条显示所有 Loss ★★★
             pbar.set_postfix({
                 'Seg': f"{l_main.item():.3f}",
                 'Aux': f"{l_aux.item():.3f}",
@@ -290,7 +317,8 @@ def train():
         with torch.no_grad():
             for v, i_img, l, _, _, _ in tqdm(val_dl, desc="Val"):
                 v, i_img, l = v.cuda(), i_img.cuda(), l.cuda()
-                seg_out, _, _, _ = model(v, i_img, gt_semantic=l)
+                # 验证阶段不需要 entropy maps
+                seg_out, _, _, _ = model(vis=v, ir=i_img, gt_semantic=l)
                 loss_val = crit_seg(seg_out, l)
                 val_loss_total += loss_val.item()
                 val_steps += 1
@@ -299,7 +327,6 @@ def train():
         avg_val_loss = val_loss_total / max(val_steps, 1)
         res = evaluator.get_metrics()
 
-        # 打印本轮总结 (包含所有平均 Loss)
         steps = len(train_dl)
         print(f"📊 Summary Ep {ep + 1}:")
         print(
