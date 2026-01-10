@@ -30,10 +30,6 @@ class Router(nn.Module):
         # 1x1 卷积等价于像素级的 Linear Layer
         self.net = nn.Conv2d(in_channels, 1, kernel_size=1)
 
-        # 初始化
-        nn.init.xavier_normal_(self.net.weight, gain=0.01)
-        nn.init.constant_(self.net.bias, 0.0)
-
     def forward(self, entropy_map):
         return self.net(entropy_map)
 
