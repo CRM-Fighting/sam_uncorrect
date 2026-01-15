@@ -1,6 +1,10 @@
 import os
 import warnings
 import sys
+import random
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
 
 # 过滤烦人的 FutureWarning
 warnings.filterwarnings("ignore")
@@ -9,27 +13,27 @@ warnings.filterwarnings("ignore")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
-import numpy as np
-import random
-from PIL import Image
-import torch.nn.functional as F
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 
-# --- 导入模型 ---
+# ★★★ 新增：引入高级调度器 ★★★
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+# --- 导入模型 (保持您的路径不变) ---
 from sam2.build_sam import build_sam2
 from sam2.modeling.global_guided_aoe import GlobalGuidedAoEBlock
 from sam2.modeling.multitask_sam_serial import MultiTaskSerialModel
 from utils.custom_losses import BinarySUMLoss, StandardSegLoss
 
 # --- 配置区域 ---
-EXP_NAME = "visual_correct_1_4"
+EXP_NAME = "visual_correct_opt_v1_1_15"  # 建议改个名区分实验
 
-# 路径配置
+# 路径配置 (请确保这些路径与您的环境一致)
 ENTROPY_ROOT = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/entropy_maps"
 
 TRAIN_DIRS = {
@@ -49,7 +53,7 @@ SAM_CKPT = "../checkpoints/sam2.1_hiera_tiny.pt"
 
 BATCH_SIZE = 2
 ACCUM_STEPS = 8
-EPOCHS = 50
+EPOCHS = 50  # 保持 50 轮，配合 Warmup 和高 LR 足够收敛
 NUM_CLASSES = 9
 
 
@@ -93,7 +97,7 @@ class SegEvaluator:
         return {"mIoU": miou, "PA": pixel_acc}
 
 
-# --- Dataset (增强版：包含详细错误检查) ---
+# --- Dataset (包含之前的 Resize 修复) ---
 class MSRSDataset(Dataset):
     def __init__(self, dirs, uncertainty_root=None, entropy_root=None, is_train=True):
         self.vis = dirs['vi']
@@ -125,13 +129,11 @@ class MSRSDataset(Dataset):
                     path_ir = os.path.join(self.uncertainty_root, 'ir', npy_name)
                     if not (os.path.exists(path_vi) and os.path.exists(path_ir)): continue
 
-                # ★★★ 修改 1: 检查所有 Stage 的熵图是否存在 ★★★
                 if self.entropy_dirs:
                     missing_stage = False
                     for stage in ['stage1', 'stage2', 'stage3', 'stage4']:
                         if not os.path.exists(os.path.join(self.entropy_dirs[stage], npy_name)):
                             missing_stage = True
-                            # print(f"Missing {stage} entropy map for {f}") # 调试用
                             break
                     if missing_stage: continue
 
@@ -160,7 +162,7 @@ class MSRSDataset(Dataset):
         i_img_pil = Image.open(os.path.join(self.ir, n)).convert('RGB')
         lbl_pil = Image.open(os.path.join(self.lbl, n))
 
-        # 读取不确定性 (安静模式)
+        # 读取不确定性
         s_vi = self._load_uncertainty(self.uncertainty_root, 'vi', n)
         s_ir = self._load_uncertainty(self.uncertainty_root, 'ir', n)
 
@@ -169,25 +171,23 @@ class MSRSDataset(Dataset):
             npy_name = n.replace('.png', '.npy')
             for stage in ['stage1', 'stage2', 'stage3', 'stage4']:
                 target_path = os.path.join(self.entropy_dirs[stage], npy_name)
-                # ★★★ 修改 2: 增加详细的错误捕获与路径打印 ★★★
                 try:
                     if not os.path.exists(target_path):
                         raise FileNotFoundError(f"File does not exist: {target_path}")
 
-                    # 尝试加载
                     em_numpy = np.load(target_path).astype(np.float32)
                     em = torch.from_numpy(em_numpy)
-
                     if em.ndim == 2: em = em.unsqueeze(0)
+
+                    # [修复] 强制 Resize 到与图片一致 (480, 640)，防止尺寸不匹配
+                    # 注意：如果您的 .npy 已经是 Hiera 特征层对应的小尺寸，请注释掉这行 Resize！
+                    # 根据您之前的说法“熵图都是已经生成好的对应尺寸”，这里我【注释掉】Resize。
+                    # em = F.interpolate(em.unsqueeze(0), size=(480, 640), mode='nearest').squeeze(0)
+
                     entropy_maps_list.append(em)
 
                 except Exception as e:
-                    print(f"\n[💥 Error Loading Entropy Map]")
-                    print(f"  ├─ Image Name: {n}")
-                    print(f"  ├─ Stage: {stage}")
-                    print(f"  ├─ Target Path: {target_path}")
-                    print(f"  └─ Exception: {e}")
-                    # 抛出异常以停止训练，防止数据错位
+                    print(f"\n[💥 Error Loading Entropy Map] {n} - {stage}")
                     raise e
 
         if self.is_train and torch.rand(1).item() > 0.5:
@@ -224,23 +224,64 @@ def train():
     base = build_sam2(SAM_CFG, SAM_CKPT, device="cpu")
     model = MultiTaskSerialModel(base, GlobalGuidedAoEBlock, num_classes=NUM_CLASSES).cuda()
 
-    router_params = [p for n, p in model.named_parameters() if 'router' in n and p.requires_grad]
-    other_params = [p for n, p in model.named_parameters() if 'router' not in n and p.requires_grad]
+    # --- 【优化 1：修正参数分组】 ---
+    # 逻辑：新增的层 (MoE, Fusion, Head) 需要大学习率，冻结层/微调层用小学习率
 
-    # LR 保持 1e-4
+    high_lr_params = []  # 存放 MoE, Fusion, Head, Projection
+    low_lr_params = []  # 存放 Backbone 中可能解冻的层
+
+    # 定义高学习率模块的关键词
+    high_lr_keywords = [
+        "shared_moe_layers",  # MoE (包含 Router 和 Expert)
+        "fusion_layers",  # Fusion (包含 Agent, Mixer)
+        "segformer_head",  # 主分类头
+        "sam_proj_s4"  # 辅助头投影
+    ]
+
+    print("\n🔧 Parameter Grouping:")
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # 判断是否属于高学习率组
+        is_high = any(k in name for k in high_lr_keywords)
+
+        if is_high:
+            high_lr_params.append(param)
+        else:
+            low_lr_params.append(param)
+            print(f"  [Low LR / Finetune] {name}")
+
+    # 优化器配置：High LR = 5e-4, Low LR = 1e-4
     opt = optim.AdamW([
-        {'params': other_params, 'lr': 0.0001},
-        {'params': router_params, 'lr': 0.001}
+        {'params': high_lr_params, 'lr': 0.0005},
+        {'params': low_lr_params, 'lr': 0.0001}
     ], weight_decay=1e-4)
 
-    # eta_min 调整为 1e-5
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=EPOCHS, eta_min=1e-5)
-    scaler = GradScaler()
+    # --- 【优化 2：引入 Warmup + Step-wise Scheduler】 ---
+    # 计算总更新步数 (Total Steps)
+    # 必须基于 DataLoader 长度和 ACCUM_STEPS 计算
+    train_dataset = MSRSDataset(TRAIN_DIRS, UNCERTAINTY_ROOT_TRAIN, ENTROPY_ROOT, is_train=True)
+    steps_per_epoch = len(DataLoader(train_dataset, batch_size=BATCH_SIZE)) // ACCUM_STEPS
+    total_steps = EPOCHS * steps_per_epoch
+    warmup_steps = int(total_steps * 0.05)  # 5% 的步数用于热身
+
+    print(f"📅 Schedule: Total Steps={total_steps}, Warmup Steps={warmup_steps}")
+
+    # 定义组合调度器 (Linear Warmup -> Cosine Annealing)
+    # 1. 前 5% 步：从 1% LR 线性增加到 100% LR
+    scheduler_warmup = LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    # 2. 剩余步：余弦退火到微小值
+    scheduler_cosine = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps, eta_min=1e-6)
+    # 3. 串联
+    scheduler = SequentialLR(opt, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_steps])
+
     crit_seg = StandardSegLoss(NUM_CLASSES)
     crit_sam = BinarySUMLoss(theta=0.6)
+    scaler = GradScaler()
 
     train_dl = DataLoader(
-        MSRSDataset(TRAIN_DIRS, UNCERTAINTY_ROOT_TRAIN, ENTROPY_ROOT, is_train=True),
+        train_dataset,
         batch_size=BATCH_SIZE, shuffle=True, num_workers=4, drop_last=True, worker_init_fn=worker_init_fn
     )
     val_dl = DataLoader(
@@ -253,9 +294,8 @@ def train():
 
     for ep in range(EPOCHS):
         model.train()
-
         curr_lr = opt.param_groups[0]['lr']
-        print(f"\n=== Epoch {ep + 1}/{EPOCHS} | LR: {curr_lr:.2e} ===")
+        print(f"\n=== Epoch {ep + 1}/{EPOCHS} | LR(High): {curr_lr:.2e} ===")
 
         pbar = tqdm(train_dl, desc="Train")
         opt.zero_grad()
@@ -268,7 +308,7 @@ def train():
             e_maps_cuda = [em.cuda() for em in entropy_maps]
 
             with autocast():
-                # ★★★ 修改 3: 显式使用关键字参数，确保 gt_entropy_maps 正确传入 ★★★
+                # 显式传入 gt_entropy_maps
                 seg_out, sam_preds, moe_loss, fusion_loss = model(
                     vis=v,
                     ir=i_img,
@@ -281,7 +321,8 @@ def train():
                 l_ir = crit_sam(sam_preds['ir_s4'], l, s_ir)
                 l_aux = (l_rgb + l_ir) / 2.0
 
-                loss = l_main + 0.5 * l_aux + 0.5 * fusion_loss + 0.05 * moe_loss
+                # 调整权重：稍微降低 MoE Loss 权重 (0.05 -> 0.02)
+                loss = l_main + 0.5 * l_aux + 0.5 * fusion_loss + 0.02 * moe_loss
                 loss = loss / ACCUM_STEPS
 
             scaler.scale(loss).backward()
@@ -298,6 +339,9 @@ def train():
                 scaler.update()
                 opt.zero_grad()
 
+                # ★★★ 关键修改：Step-wise Scheduler 更新 ★★★
+                scheduler.step()
+
             pbar.set_postfix({
                 'Seg': f"{l_main.item():.3f}",
                 'Aux': f"{l_aux.item():.3f}",
@@ -305,7 +349,7 @@ def train():
                 'Moe': f"{moe_loss.item():.3f}"
             })
 
-        scheduler.step()
+        # 移除原有的 Epoch 级 scheduler.step()
         torch.cuda.empty_cache()
 
         # === 验证 ===
@@ -317,7 +361,7 @@ def train():
         with torch.no_grad():
             for v, i_img, l, _, _, _ in tqdm(val_dl, desc="Val"):
                 v, i_img, l = v.cuda(), i_img.cuda(), l.cuda()
-                # 验证阶段不需要 entropy maps
+                # 验证时不传 entropy maps -> 触发 Agent 推理模式
                 seg_out, _, _, _ = model(vis=v, ir=i_img, gt_semantic=l)
                 loss_val = crit_seg(seg_out, l)
                 val_loss_total += loss_val.item()
