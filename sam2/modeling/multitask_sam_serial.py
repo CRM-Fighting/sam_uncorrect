@@ -7,10 +7,10 @@ from sam2.modeling.fusion import DynamicFusionModule
 
 class MultiTaskSerialModel(SerialSegModel):
     """
-    多任务模型:
-    1. Backbone: Shared MoE (串行)
-    2. Fusion: DynamicFusionModule (Cross-Mixer + 门控残差)
-    3. SAM Aux: 仅使用 Stage 4 特征，通过简单的 Conv 预测 Mask
+    多任务模型 (SAM Decoder 版 - 修复尺寸匹配问题):
+    1. Backbone: Shared MoE
+    2. Fusion: DynamicFusionModule
+    3. SAM Aux: Stage 4 特征 + SAM Decoder (带插值修正)
     """
 
     def __init__(self, base_sam, moe_class, num_classes=9):
@@ -23,25 +23,73 @@ class MultiTaskSerialModel(SerialSegModel):
         ])
 
         # 2. 冻结 SAM 组件
-        for param in self.backbone.base_sam.sam_prompt_encoder.parameters(): param.requires_grad = False
-        for param in self.backbone.base_sam.sam_mask_decoder.parameters(): param.requires_grad = False
+        for param in self.backbone.base_sam.sam_prompt_encoder.parameters():
+            param.requires_grad = False
+        for param in self.backbone.base_sam.sam_mask_decoder.parameters():
+            param.requires_grad = False
 
         self.backbone.base_sam.sam_mask_decoder.use_high_res_features = False
 
-        # 3. 辅助任务头 (修复：输出通道改为 1，用于二分类 Loss)
-        # 结构：Conv(768->256) -> ReLU -> Conv(256->1)
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(channels[-1], 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 1, kernel_size=1)
+        # 3. 投影层
+        self.sam_proj_s4 = nn.Conv2d(768, 256, kernel_size=1)
+
+    def get_prompt(self, gt):
+        """ 从 GT 中随机采样点提示 """
+        B, H, W = gt.shape
+        coords, labels = [], []
+        for i in range(B):
+            y, x = torch.where(gt[i] > 0)
+            if len(y) > 0:
+                idx = torch.randint(len(y), (1,)).item()
+                coords.append([x[idx].item(), y[idx].item()])
+                labels.append(1)
+            else:
+                coords.append([W // 2, H // 2])
+                labels.append(0)
+        return torch.tensor(coords, device=gt.device).unsqueeze(1).float(), \
+            torch.tensor(labels, device=gt.device).unsqueeze(1)
+
+    def run_sam_head(self, feat, gt, proj):
+        # 1. 投影特征
+        sam_feat = proj(feat)  # [B, 256, 15, 20]
+        target_size = sam_feat.shape[-2:]  # (15, 20)
+
+        # 2. 获取 Prompt
+        pt_c, pt_l = self.get_prompt(gt)
+
+        # 3. 编码 Prompt
+        with torch.no_grad():
+            sparse, dense = self.backbone.base_sam.sam_prompt_encoder(
+                points=(pt_c, pt_l),
+                boxes=None,
+                masks=None
+            )
+            # dense 的原始尺寸通常是 64x64 (SAM2默认)
+
+        # 4. ★★★ [核心修复] 插值 dense embeddings 到当前特征图尺寸 (15x20) ★★★
+        if dense.shape[-2:] != target_size:
+            dense = F.interpolate(dense, size=target_size, mode='bilinear', align_corners=False)
+
+        # 5. 插值 Positional Encoding (PE)
+        pe = self.backbone.base_sam.sam_prompt_encoder.get_dense_pe()
+        if pe.shape[-2:] != target_size:
+            pe = F.interpolate(pe, size=target_size, mode='bilinear', align_corners=False)
+
+        # 6. 解码
+        low_res, iou_pred, _, _ = self.backbone.base_sam.sam_mask_decoder(
+            image_embeddings=sam_feat,
+            image_pe=pe,
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,  # 现在 dense 的尺寸正确了
+            multimask_output=False,
+            repeat_image=False,
+            high_res_features=None
         )
+        return low_res
 
     def forward(self, vis, ir, gt_semantic=None, gt_entropy_maps=None, gt_entropy_vis=None, gt_entropy_ir=None):
-        # 1. 基础流 (MoE Backbone)
         feats_rgb, feats_ir, moe_loss = self.backbone(vis, ir)
 
-        # 2. Fusion 流
         fused = []
         total_fusion_loss = 0
         for i in range(4):
@@ -56,23 +104,20 @@ class MultiTaskSerialModel(SerialSegModel):
                 gt_entropy_vis=ent_vis,
                 gt_entropy_ir=ent_ir
             )
-
             fused.append(f_out)
             total_fusion_loss += f_loss
 
-        # 主任务 SegFormer Head
         seg_logits = self.segformer_head(fused)
         seg_logits = F.interpolate(seg_logits, size=vis.shape[2:], mode='bilinear')
 
-        # 3. SAM 辅助流 (修复：计算 Logits 并上采样)
         sam_preds = {}
-        if gt_semantic is not None:  # 仅训练时计算
-            # 使用 Stage 4 特征预测二值掩码
-            aux_logits = self.aux_head(fused[-1])
-            # 上采样到原图尺寸 (480x640) 以匹配 GT
-            aux_logits = F.interpolate(aux_logits, size=vis.shape[2:], mode='bilinear', align_corners=False)
-
-            sam_preds['rgb_s4'] = aux_logits
-            sam_preds['ir_s4'] = aux_logits
+        if gt_semantic is not None:
+            H, W = vis.shape[2:]
+            # RGB Aux
+            out_r = self.run_sam_head(feats_rgb[-1], gt_semantic, self.sam_proj_s4)
+            sam_preds['rgb_s4'] = F.interpolate(out_r, size=(H, W), mode='bilinear')
+            # IR Aux
+            out_i = self.run_sam_head(feats_ir[-1], gt_semantic, self.sam_proj_s4)
+            sam_preds['ir_s4'] = F.interpolate(out_i, size=(H, W), mode='bilinear')
 
         return seg_logits, sam_preds, moe_loss, total_fusion_loss

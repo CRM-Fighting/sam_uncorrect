@@ -80,7 +80,7 @@ class DynamicFusionModule(nn.Module):
 
         # 可视化设置
         self.vis_count = 0
-        self.vis_root = "vis_entropy_no_gate_no_limit"  # 更新文件夹名
+        self.vis_root = "vis_entropy_no_gate_no_limit_1_20"  # 更新文件夹名
         self.vis_train_dir = os.path.join(self.vis_root, "train")
         self.vis_val_dir = os.path.join(self.vis_root, "val")
         os.makedirs(self.vis_train_dir, exist_ok=True)

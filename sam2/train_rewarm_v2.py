@@ -31,7 +31,7 @@ from sam2.modeling.multitask_sam_serial import MultiTaskSerialModel
 from utils.custom_losses import BinarySUMLoss, StandardSegLoss
 
 # --- 配置区域 ---
-EXP_NAME = "publication_v2_cross_mixer_final_logs_fixed_1_19"
+EXP_NAME = "publication_v2_cross_mixer_final_logs_fixed_1_20"
 
 # 路径配置
 ENTROPY_ROOT = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/entropy_maps_add"
@@ -53,7 +53,7 @@ SAM_CKPT = "../checkpoints/sam2.1_hiera_tiny.pt"
 
 BATCH_SIZE = 2
 ACCUM_STEPS = 8
-EPOCHS = 60
+EPOCHS = 100
 NUM_CLASSES = 9
 
 

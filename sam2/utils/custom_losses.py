@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torchvision.ops import sigmoid_focal_loss
 
 class BinarySUMLoss(nn.Module):
-    # (保持原有的 BinarySUMLoss 不变)
     def __init__(self, theta=0.6, focal_weight=20.0, dice_weight=1.0):
         super().__init__()
         self.theta = theta
@@ -32,27 +31,30 @@ class BinarySUMLoss(nn.Module):
 
         return term_focal + term_dice
 
+
 class StandardSegLoss(nn.Module):
-    """ [修改] 优化权重的 SegLoss """
     def __init__(self, num_classes=9):
         super().__init__()
         self.num_classes = num_classes
-        self.ce_weights = torch.ones(num_classes)
-        self.ce_weights[0] = 0.4
+        # [保持] 类别加权：背景 0.1，其他 1.0
+        self.ce_weights = torch.tensor([0.1] + [1.0] * (num_classes - 1))
 
     def forward(self, preds, labels):
         if self.ce_weights.device != preds.device:
             self.ce_weights = self.ce_weights.to(preds.device)
 
+        # 1. CE Loss
         loss_ce = F.cross_entropy(preds, labels, weight=self.ce_weights, ignore_index=255)
 
+        # 2. Dice Loss (针对存在的类别)
         pred_soft = F.softmax(preds, dim=1)
         target_one_hot = F.one_hot(labels, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
 
-        inter = (pred_soft * target_one_hot).sum(dim=(2, 3))
-        union = pred_soft.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
-        loss_dice = 1 - (2. * inter + 1) / (union + 1)
+        dims = (0, 2, 3)
+        intersection = (pred_soft * target_one_hot).sum(dims)
+        cardinality = pred_soft.sum(dims) + target_one_hot.sum(dims)
 
-        # [修改] 提高 Dice 权重: 0.5 -> 0.7, 降低 CE: 0.5 -> 0.3
-        # 这样模型会更在意 IoU，而不是单纯的像素分类准确率
-        return 0.3 * loss_ce + 0.7 * loss_dice.mean()
+        dice_score = (2. * intersection + 1.0) / (cardinality + 1.0)
+        dice_loss = 1.0 - dice_score
+
+        return 0.5 * loss_ce + 0.5 * dice_loss.mean()
