@@ -15,7 +15,7 @@ from sam2.modeling.global_guided_aoe import GlobalGuidedAoEBlock
 from sam2.modeling.multitask_sam_serial import MultiTaskSerialModel
 
 # ================= 配置区域 =================
-CKPT_PATH = "checkpoints/publication_v2_cross_mixer_final_logs_fixed_1_20/best_model.pth"
+CKPT_PATH = "checkpoints/1_27日23点权重/best_model.pth"
 ENTROPY_ROOT = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/entropy_maps_add"
 TEST_DIRS = {
     'vi': '/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/test/vi',
@@ -24,7 +24,7 @@ TEST_DIRS = {
 }
 
 # 输出文件夹
-OUTPUT_DIR = "test_results_gt_vs_pred"
+OUTPUT_DIR = "1_22日17点训练结果"
 
 CLASS_NAMES = [
     "Background", "Car", "Person", "Bike", "Curve",
@@ -172,10 +172,17 @@ class Evaluator:
         self.confusion_matrix += confusion_matrix
 
     def get_miou_and_pa(self):
-        intersection = np.diag(self.confusion_matrix)
+        """
+        计算mIoU和全局像素准确率
+        返回:
+            miou: 平均交并比
+            pa: 全局像素准确率
+            class_iou: 每个类别的IoU
+        """
+        intersection = np.diag(self.confusion_matrix)  # 各类别正确预测的像素数
         union = np.sum(self.confusion_matrix, axis=1) + np.sum(self.confusion_matrix, axis=0) - intersection
 
-        # 剔除 Union 为 0 的类别
+        # 计算mIoU (剔除Union为0的类别)
         valid_mask = union > 0
         if valid_mask.sum() == 0:
             miou = 0.0
@@ -183,11 +190,31 @@ class Evaluator:
             iou = intersection[valid_mask] / (union[valid_mask] + 1e-10)
             miou = np.mean(iou)
 
-        acc = np.diag(self.confusion_matrix).sum() / (self.confusion_matrix.sum() + 1e-10)
-        full_iou = np.zeros(self.num_classes)
-        full_iou[valid_mask] = intersection[valid_mask] / (union[valid_mask] + 1e-10)
+        # 计算全局像素准确率 (PA)
+        pa = np.diag(self.confusion_matrix).sum() / (self.confusion_matrix.sum() + 1e-10)
 
-        return miou, acc, full_iou
+        # 每个类别的IoU
+        class_iou = np.zeros(self.num_classes)
+        class_iou[valid_mask] = intersection[valid_mask] / (union[valid_mask] + 1e-10)
+
+        return miou, pa, class_iou
+
+    def get_class_pa(self):
+        """
+        计算每个类别的像素准确率 (Class-wise Pixel Accuracy)
+        返回:
+            class_pa: 每个类别的像素准确率
+        """
+        class_pa = np.zeros(self.num_classes)
+        for cls in range(self.num_classes):
+            # 该类别真实像素总数
+            gt_pixels = np.sum(self.confusion_matrix[cls, :])
+            if gt_pixels == 0:
+                class_pa[cls] = 0.0
+            else:
+                # 该类别预测正确的像素数 / 该类别真实像素总数
+                class_pa[cls] = self.confusion_matrix[cls, cls] / (gt_pixels + 1e-10)
+        return class_pa
 
 
 # ================= 主函数 =================
@@ -217,6 +244,7 @@ def test():
 
     global_evaluator = Evaluator(NUM_CLASSES)
     total_image_miou = 0.0
+    total_image_pa = 0.0  # 新增：累加单张图片的PA
     valid_samples = 0
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -244,34 +272,38 @@ def test():
             # 1. 计算指标
             single_eval = Evaluator(NUM_CLASSES)
             single_eval.add_batch(gt, pred)
-            s_miou, s_pa, _ = single_eval.get_miou_and_pa()
+            s_miou, s_pa, _ = single_eval.get_miou_and_pa()  # s_pa是单张图片的PA
 
             total_image_miou += s_miou
+            total_image_pa += s_pa  # 新增：累加单张PA
             valid_samples += 1
             global_evaluator.add_batch(gt, pred)
 
-            # 2. ★★★ 可视化拼接 (GT 左, Pred 右) ★★★
+            # 2. 可视化拼接 (GT 左, Pred 右)
             save_name = fname
             save_path = os.path.join(OUTPUT_DIR, save_name)
-
             save_comparison_vis(pred, gt, save_path)
 
     # --- 最终打印指标 ---
-    g_miou, g_pa, class_iou = global_evaluator.get_miou_and_pa()
+    g_miou, g_pa, class_iou = global_evaluator.get_miou_and_pa()  # g_pa是全局PA
+    class_pa = global_evaluator.get_class_pa()  # 新增：获取每个类别的PA
     avg_img_miou = total_image_miou / max(valid_samples, 1)
+    avg_img_pa = total_image_pa / max(valid_samples, 1)  # 新增：平均单张图片PA
 
-    print("\n" + "=" * 45)
+    print("\n" + "=" * 60)
     print(f"📊 Final Test Results")
-    print(f"   Global Mean IoU: {g_miou * 100:.2f}%")
-    print(f"   Avg Image mIoU:   {avg_img_miou * 100:.2f}%")
-    print("-" * 45)
-    print(f"{'Class Name':<15} | {'IoU (%)':<10}")
-    print("-" * 45)
-    for idx, iou in enumerate(class_iou):
-        print(f"{CLASS_NAMES[idx]:<15} | {iou * 100:.2f}%")
-    print("-" * 45)
+    print(f"   Global Mean IoU:    {g_miou * 100:.2f}%")
+    print(f"   Global Pixel Acc:   {g_pa * 100:.2f}%")  # 新增：打印全局PA
+    print(f"   Avg Image mIoU:     {avg_img_miou * 100:.2f}%")
+    print(f"   Avg Image Pixel Acc:{avg_img_pa * 100:.2f}%")  # 新增：打印平均单张PA
+    print("-" * 60)
+    print(f"{'Class Name':<15} | {'IoU (%)':<10} | {'PA (%)':<10}")  # 新增：PA列
+    print("-" * 60)
+    for idx, (iou, pa) in enumerate(zip(class_iou, class_pa)):  # 新增：遍历类别PA
+        print(f"{CLASS_NAMES[idx]:<15} | {iou * 100:.2f}%     | {pa * 100:.2f}%")
+    print("-" * 60)
     print(f"✅ All visualizations (GT vs Pred) saved to: {OUTPUT_DIR}/")
-    print("=" * 45)
+    print("=" * 60)
 
 
 if __name__ == "__main__":
