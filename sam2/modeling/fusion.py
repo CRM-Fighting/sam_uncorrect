@@ -5,7 +5,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ==========================================
-# 1. 基础组件：稀疏相对位置编码 (Sparse RPE)
+# 1. 基础组件：稀疏相对位置编码
 # ==========================================
 class SparseRelativePositionBias(nn.Module):
     def __init__(self, num_heads, max_dist=128):
@@ -19,7 +19,6 @@ class SparseRelativePositionBias(nn.Module):
         nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
 
     def forward(self, coords_q, coords_k):
-        # coords: [B, N, 2]
         relative_coords = coords_q[:, :, None, :] - coords_k[:, None, :, :]
         relative_coords += self.max_dist
         relative_coords[:, :, :, 0] = relative_coords[:, :, :, 0].clamp(0, 2 * self.max_dist)
@@ -36,58 +35,66 @@ class SparseRelativePositionBias(nn.Module):
 
 
 # ==========================================
-# 2. 熵特征注入器 (Entropy Injector)
+# 2. 熵特征注入器
 # ==========================================
 class EntropyInjector(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        # 将 1 维熵映射为 Scale 和 Shift 参数
         self.net = nn.Sequential(
             nn.Linear(1, dim // 4),
             nn.SiLU(),
-            nn.Linear(dim // 4, dim * 2)  # 输出 scale 和 shift
+            nn.Linear(dim // 4, dim * 2)
         )
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x, entropy):
-        # x: [B, N, C]
-        # entropy: [B, N, 1]
-
-        # 计算调节参数
-        style = self.net(entropy)  # [B, N, 2*C]
+        style = self.net(entropy)
         scale, shift = style.chunk(2, dim=-1)
-
-        # AdaIN 风格注入： x = x * (1 + scale) + shift
         x = self.norm(x)
         x = x * (1 + scale) + shift
         return x
 
 
 # ==========================================
-# 3. [重构] 选择性多尺度修补 (Selective Multi-Scale Refinement)
-# 核心思想：Concat -> Softmax Selection -> Weighted Sum
-# 解决问题：既保留护栏细节(3x3)，又连接减速带(7x7)
+# 3. [新增] 特征校正模块 (From CMX 论文)
+# 作用：在融合前，利用互补模态来校正当前模态的噪声
+# ==========================================
+class FeatureRectificationModule(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(2 * dim, dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(16, dim),  # 使用GN更稳
+            nn.Sigmoid()
+        )
+
+    def forward(self, feat_main, feat_aux):
+        # 拼接两个模态
+        cat = torch.cat([feat_main, feat_aux], dim=1)
+        # 生成门控权重
+        gate = self.conv(cat)
+        # 校正：原始特征 + 加权后的原始特征 (类似于残差增强)
+        rectified = feat_main + feat_main * gate
+        return rectified
+
+
+# ==========================================
+# 4. [稳健版] 门控多尺度修补
+# 注意：这里改回了 Sigmoid + LayerNorm，这是防止崩盘和保护护栏的关键
 # ==========================================
 class MultiScaleRefinementBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
-
-        # 分支1: 局部细节 (3x3) - 专注细小物体（护栏、锥桶）
         self.local_branch = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),  # DW-Conv
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim),
             nn.GELU(),
-            nn.Conv2d(dim, dim, 1)  # PW-Conv
+            nn.Conv2d(dim, dim, 1)
         )
-
-        # 分支2: 长距离上下文 (7x7) - 专注大物体连接（减速带、弯道）
         self.context_branch = nn.Sequential(
             nn.Conv2d(dim, dim, 7, padding=3, groups=dim),
             nn.GELU(),
             nn.Conv2d(dim, dim, 1)
         )
-
-        # 分支3: 全局先验 (Global) - 专注整体光照调节
-        # 这是一个门控网络，不直接参与加权竞争，而是调节前两个分支
         self.global_branch = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(dim, dim // 4, 1),
@@ -95,62 +102,51 @@ class MultiScaleRefinementBlock(nn.Module):
             nn.Conv2d(dim // 4, dim, 1),
             nn.Sigmoid()
         )
-
-        # [新增] 选择网络 (The Selector)
-        # 输入: 拼接后的特征 (Identity + Local + Context) -> 3*C
-        # 输出: 3个权重图 (Identity权重, Local权重, Context权重)
-        self.select_conv = nn.Sequential(
+        # 使用 Sigmoid 独立控制，让护栏和减速带共存
+        self.gate_conv = nn.Sequential(
             nn.Conv2d(dim * 3, dim // 2, 1),
             nn.ReLU(),
-            nn.Conv2d(dim // 2, 3, 1)  # 输出3个通道
+            nn.Conv2d(dim // 2, 2, 1),
+            nn.Sigmoid()
         )
-
-        # 最后的融合投影
         self.proj = nn.Conv2d(dim, dim, 1)
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(dim)  # 核心刹车片
 
     def forward(self, x):
-        B, C, H, W = x.shape
         identity = x
-
-        # 1. 计算各分支特征
         feat_local = self.local_branch(x)
         feat_context = self.context_branch(x)
 
-        # 全局门控：像调色板一样，调节所有分支的基调
-        global_gate = self.global_branch(x)  # [B, C, 1, 1]
+        global_gate = self.global_branch(x)
         feat_local = feat_local * global_gate
         feat_context = feat_context * global_gate
 
-        # 2. [核心] Concat + 选择权重计算
-        # 我们把原始特征、局部修补、上下文修补拼在一起
-        # 形状变 [B, 3C, H, W]
         stack = torch.cat([identity, feat_local, feat_context], dim=1)
+        gates = self.gate_conv(stack)
 
-        # 生成权重 [B, 3, H, W] -> Softmax 归一化
-        # 这一步决定了每个像素点“听谁的”
-        weights = F.softmax(self.select_conv(stack), dim=1)
+        g_local = gates[:, 0:1, :, :]
+        g_context = gates[:, 1:2, :, :]
 
-        # 拆分权重
-        w_id = weights[:, 0:1, :, :]
-        w_lo = weights[:, 1:2, :, :]
-        w_co = weights[:, 2:3, :, :]
+        # 叠加融合
+        out = identity + g_local * feat_local + g_context * feat_context
 
-        # 3. 加权融合 (Weighted Sum)
-        # 在护栏处，w_lo 会很大；在减速带处，w_co 会很大
-        out = w_id * identity + w_lo * feat_local + w_co * feat_context
+        # [Norm] 防止梯度爆炸
+        out = out.permute(0, 2, 3, 1)
+        out = self.norm(out)
+        out = out.permute(0, 3, 1, 2)
 
         out = self.proj(out)
         return out
 
 
 # ==========================================
-# 4. 混合差分注意力 (Pixel-wise Alpha)
+# 5. 混合差分注意力
 # ==========================================
 class DifferentialCrossAttention(nn.Module):
-    def __init__(self, dim, num_heads=4, qkv_bias=True, attn_drop=0., proj_drop=0., lambda_init=0.8):
+    # 保持 Dropout 0.1，这是最佳版本的参数
+    def __init__(self, dim, num_heads=4, qkv_bias=True, attn_drop=0.1, proj_drop=0.1, lambda_init=0.8):
         super().__init__()
-        assert num_heads % 2 == 0, "num_heads must be even"
+        assert num_heads % 2 == 0
         self.num_heads = num_heads
         self.dim = dim
         self.head_dim = dim // num_heads
@@ -160,7 +156,6 @@ class DifferentialCrossAttention(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
 
-        # 差分参数
         self.lambda_q1 = nn.Parameter(torch.zeros(num_heads // 2, self.head_dim).normal_(mean=0, std=0.1))
         self.lambda_k1 = nn.Parameter(torch.zeros(num_heads // 2, self.head_dim).normal_(mean=0, std=0.1))
         self.lambda_q2 = nn.Parameter(torch.zeros(num_heads // 2, self.head_dim).normal_(mean=0, std=0.1))
@@ -182,13 +177,11 @@ class DifferentialCrossAttention(nn.Module):
 
         rpe_bias = self.rpe(coords_q, coords_k)
 
-        # Standard Attention
         attn_score_std = (q @ k.transpose(-2, -1)) * self.scale
         attn_score_std = attn_score_std + rpe_bias
         attn_probs_std = torch.softmax(attn_score_std, dim=-1)
         x_std = (attn_probs_std @ v)
 
-        # Differential Attention
         n_half = self.num_heads // 2
         attn_probs_1 = attn_probs_std[:, :n_half]
         attn_probs_2 = attn_probs_std[:, n_half:]
@@ -201,10 +194,8 @@ class DifferentialCrossAttention(nn.Module):
         attn_diff = attn_probs_1 - lambda_full * attn_probs_2
         x_diff_part = (attn_diff @ v[:, :n_half])
 
-        # Dynamic Fusion
         x_std_1 = x_std[:, :n_half]
         if alpha_map is not None:
-            # alpha_map: [B, N, 1] -> [B, 1, N, 1]
             alpha = alpha_map.unsqueeze(1)
             x_final_1 = x_std_1 + alpha * x_diff_part
         else:
@@ -226,14 +217,10 @@ class DiffCrossMixerBlock(nn.Module):
         self.norm_q = nn.LayerNorm(dim)
         self.norm_kv = nn.LayerNorm(dim)
         self.norm_ffn = nn.LayerNorm(dim)
-
-        # 熵注入模块
         self.injector = EntropyInjector(dim)
-
         self.diff_attn = DifferentialCrossAttention(
             dim, num_heads=num_heads, attn_drop=dropout, proj_drop=dropout
         )
-
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4),
             nn.GELU(),
@@ -242,37 +229,33 @@ class DiffCrossMixerBlock(nn.Module):
         )
 
     def forward(self, x_q, x_kv, coords_q, coords_k, alpha_map=None, entropy_tokens=None):
-        # 1. 先进行熵注入 (Entropy Injection)
         if entropy_tokens is not None:
             x_q = self.injector(x_q, entropy_tokens)
-
-        # 2. 注意力计算
         q = self.norm_q(x_q)
         k = self.norm_kv(x_kv)
         attn_out = self.diff_attn(x_q=q, x_kv=k, coords_q=coords_q, coords_k=coords_k, alpha_map=alpha_map)
         x = x_q + attn_out
-
-        # 3. FFN
         x = x + self.ffn(self.norm_ffn(x))
         return x
 
 
 # ==========================================
-# 5. 主模块 (DynamicFusionModule)
+# 6. 主模块 (DynamicFusionModule)
 # ==========================================
 class DynamicFusionModule(nn.Module):
     def __init__(self, dim, dropout=0.1):
         super().__init__()
         self.dim = dim
 
-        # [新增] 初始融合层：把 Concat 后的 2C 特征融合回 C
-        # 作用：智能地决定背景区域该保留多少IR，多少VIS，而不是傻傻相加
+        # [新增] 模态校正模块 (From CMX)
+        self.rect_ir = FeatureRectificationModule(dim)
+        self.rect_vis = FeatureRectificationModule(dim)
+
         self.init_fusion = nn.Sequential(
             nn.Conv2d(dim * 2, dim, 1),
             nn.LayerNorm(dim)
         )
 
-        # Alpha 生成器
         self.alpha_net = nn.Sequential(
             nn.Linear(1, 16),
             nn.SiLU(),
@@ -280,31 +263,39 @@ class DynamicFusionModule(nn.Module):
             nn.Sigmoid()
         )
 
-        # 交互模块
         self.mixer_ir = DiffCrossMixerBlock(dim, num_heads=4, dropout=dropout)
         self.mixer_vis = DiffCrossMixerBlock(dim, num_heads=4, dropout=dropout)
-
-        # [升级] 多尺度修补模块
         self.context_refine = MultiScaleRefinementBlock(dim)
+        self.aux_head = nn.Conv2d(dim, 9, kernel_size=1)
 
     def forward(self, f_ir, f_vis, gt_entropy=None, gt_entropy_vis=None, gt_entropy_ir=None):
+        # --- [新增] Modality Dropout (From U3M) ---
+        # 仅在训练时启用：10% 概率丢弃 IR，10% 概率丢弃 VIS
+        if self.training:
+            prob = torch.rand(1).item()
+            if prob < 0.1:  # 10% 概率丢弃 IR
+                f_ir = torch.zeros_like(f_ir)
+            elif prob < 0.2:  # 10% 概率丢弃 VIS
+                f_vis = torch.zeros_like(f_vis)
+
+        # --- [新增] Feature Rectification (From CMX) ---
+        # 互相校正去噪
+        f_ir = self.rect_ir(f_ir, f_vis)
+        f_vis = self.rect_vis(f_vis, f_ir)
+
+        # 融合逻辑
         B, C, H, W = f_ir.shape
         device = f_ir.device
 
-        # [修改] Concat -> Conv -> Norm
-        # 这样比直接相加好，因为不会丢失原始特征的独立性
-        base_feat_cat = torch.cat([f_ir, f_vis], dim=1)  # [B, 2C, H, W]
-        base_feat_sum = self.init_fusion[0](base_feat_cat)  # [B, C, H, W]
-
-        # LayerNorm (手动处理维度)
-        base_feat_sum = base_feat_sum.permute(0, 2, 3, 1)  # [B, H, W, C]
+        base_feat_cat = torch.cat([f_ir, f_vis], dim=1)
+        base_feat_sum = self.init_fusion[0](base_feat_cat)
+        base_feat_sum = base_feat_sum.permute(0, 2, 3, 1)
         base_feat_sum = self.init_fusion[1](base_feat_sum)
-        base_feat_sum = base_feat_sum.permute(0, 3, 1, 2)  # [B, C, H, W]
+        base_feat_sum = base_feat_sum.permute(0, 3, 1, 2)
 
         if gt_entropy is None:
-            return base_feat_sum, torch.tensor(0.0, device=device)
+            return base_feat_sum, torch.tensor(0.0, device=device), None
 
-        # --- 1. 筛选 ---
         threshold = gt_entropy.mean(dim=(2, 3), keepdim=True)
         selection_mask = (gt_entropy > threshold).float()
 
@@ -316,7 +307,6 @@ class DynamicFusionModule(nn.Module):
         final_canvas = base_feat_sum.flatten(2).transpose(1, 2).clone()
         aux_loss = torch.tensor(0.0, device=device)
 
-        # --- 2. 交互 ---
         for b in range(B):
             indices = torch.nonzero(mask_flat[b, :, 0] > 0.5).squeeze(1)
             if indices.numel() > 0:
@@ -326,29 +316,21 @@ class DynamicFusionModule(nn.Module):
 
                 sel_ir = flat_ir[b, indices].unsqueeze(0)
                 sel_vis = flat_vis[b, indices].unsqueeze(0)
-
-                # 获取稀疏熵
                 sel_entropy = flat_entropy[b, indices].unsqueeze(0)
-
-                # 计算 Alpha
                 alpha_vals = self.alpha_net(sel_entropy)
 
-                # 传入 sel_entropy 进行特征注入
                 enhanced_ir = checkpoint(self.mixer_ir, sel_ir, sel_vis, coords, coords, alpha_vals, sel_entropy,
                                          use_reentrant=False)
                 enhanced_vis = checkpoint(self.mixer_vis, sel_vis, sel_ir, coords, coords, alpha_vals, sel_entropy,
                                           use_reentrant=False)
 
                 residual = (enhanced_ir - sel_ir) + (enhanced_vis - sel_vis)
-
-                # 软加权贴回
                 fusion_weight = 0.2 + 0.8 * torch.tanh(sel_entropy)
                 weighted_residual = residual * fusion_weight
                 final_canvas[b, indices] += weighted_residual.squeeze(0)
 
         f_final = final_canvas.transpose(1, 2).view(B, C, H, W)
-
-        # --- 3. [升级] 选择性多尺度修补 ---
         f_final = self.context_refine(f_final)
+        aux_logits = self.aux_head(f_final)
 
-        return f_final, aux_loss
+        return f_final, aux_loss, aux_logits
