@@ -10,8 +10,10 @@ class MultiTaskSerialModel(SerialSegModel):
         super().__init__(base_sam, moe_class, num_classes)
 
         channels = [96, 192, 384, 768]
+
+        # 【修改】去掉 Stage 1 的 Fusion Layer，只保留后 3 个
         self.fusion_layers = nn.ModuleList([
-            DynamicFusionModule(dim=ch) for ch in channels
+            DynamicFusionModule(dim=ch) for ch in channels[1:]
         ])
 
         for param in self.backbone.base_sam.sam_prompt_encoder.parameters():
@@ -71,24 +73,43 @@ class MultiTaskSerialModel(SerialSegModel):
         total_fusion_loss = 0
         final_aux_logits = None
 
-        for i in range(4):
-            ent_sum = gt_entropy_maps[i] if (gt_entropy_maps is not None) else None
-            ent_vis = gt_entropy_vis[i] if (gt_entropy_vis is not None) else None
-            ent_ir = gt_entropy_ir[i] if (gt_entropy_ir is not None) else None
+        # 【修改】Stage 1 (High Res) 直接拼接 (Early Concat)
+        # 此时 c1_fused 维度为 96 + 96 = 192
+        c1_fused = torch.cat([feats_rgb[0], feats_ir[0]], dim=1)
+        fused.append(c1_fused)
+
+        # 【修改】Stage 2, 3, 4 走 Fusion 模块
+        # 注意：i 从 0 到 2，对应 channels[1:]，特征取 [i+1]
+        for i in range(3):
+            ent_sum = gt_entropy_maps[i + 1] if (gt_entropy_maps is not None) else None
+            ent_vis = gt_entropy_vis[i + 1] if (gt_entropy_vis is not None) else None
+            ent_ir = gt_entropy_ir[i + 1] if (gt_entropy_ir is not None) else None
 
             f_out, f_loss, aux_logit = self.fusion_layers[i](
-                f_ir=feats_ir[i],
-                f_vis=feats_rgb[i],
+                f_ir=feats_ir[i + 1],
+                f_vis=feats_rgb[i + 1],
                 gt_entropy=ent_sum,
                 gt_entropy_vis=ent_vis,
                 gt_entropy_ir=ent_ir
             )
             fused.append(f_out)
             total_fusion_loss += f_loss
-            if i == 3: final_aux_logits = aux_logit
+            if i == 2: final_aux_logits = aux_logit
 
-        # [修改] 传入 detail_feat = feats_rgb[0]
-        seg_logits = self.segformer_head(fused, detail_feat=feats_rgb[0])
+        # 【修改】Detail Feat 使用双模态拼接特征，供边缘提取
+        detail_feat_combined = torch.cat([feats_rgb[0], feats_ir[0]], dim=1)
+
+        ret = self.segformer_head(fused, detail_feat=detail_feat_combined)
+
+        # 【修改】解包返回
+        edge_prompt = None
+        if self.training:
+            if isinstance(ret, tuple):
+                seg_logits, edge_prompt = ret
+            else:
+                seg_logits = ret
+        else:
+            seg_logits = ret
 
         seg_logits = F.interpolate(seg_logits, size=vis.shape[2:], mode='bilinear')
 
@@ -100,4 +121,4 @@ class MultiTaskSerialModel(SerialSegModel):
             out_i = self.run_sam_head(feats_ir[-1], gt_semantic, self.sam_proj_s4)
             sam_preds['ir_s4'] = F.interpolate(out_i, size=(H, W), mode='bilinear')
 
-        return seg_logits, sam_preds, moe_loss, total_fusion_loss, final_aux_logits
+        return seg_logits, sam_preds, moe_loss, total_fusion_loss, final_aux_logits, edge_prompt

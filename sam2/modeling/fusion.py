@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.fft  # [新增] 频域操作需要
 from torch.utils.checkpoint import checkpoint
 
 
@@ -56,8 +57,106 @@ class EntropyInjector(nn.Module):
 
 
 # ==========================================
-# 3. [新增] 特征校正模块 (From CMX 论文)
-# 作用：在融合前，利用互补模态来校正当前模态的噪声
+# [新增 A] 频域校正模块 (From FreqSal)
+# 作用：利用互补模态的幅度(纹理)增强当前模态，保留相位(结构)
+# ==========================================
+class FrequencyRectificationModule(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        # 简单的门控，用于决定频域混合的程度
+        # 这里为了轻量化，没有使用复杂的卷积，而是直接混合
+        pass
+
+    def forward(self, x_main, x_aux):
+        B, C, H, W = x_main.shape
+        # 1. FFT 变换 (Real FFT)
+        # norm='backward' 保证能量守恒
+        fft_main = torch.fft.rfft2(x_main, norm='backward')
+        fft_aux = torch.fft.rfft2(x_aux, norm='backward')
+
+        # 2. 提取幅度 (Amplitude) 和 相位 (Phase)
+        amp_main, pha_main = torch.abs(fft_main), torch.angle(fft_main)
+        amp_aux = torch.abs(fft_aux)
+
+        # 3. 幅度混合：用 Aux 的幅度补充 Main 的幅度
+        # 这种简单的加法在频域等价于增强纹理细节
+        amp_fused = amp_main + amp_aux
+
+        # 4. 逆变换回空间域
+        # 关键：强制使用 Main 的相位，保证物体结构（如形状、位置）不发生畸变
+        fft_new = torch.polar(amp_fused, pha_main)
+        x_rect = torch.fft.irfft2(fft_new, s=(H, W), norm='backward')
+
+        # 残差连接：原始特征 + 0.2 * 频域增强特征 (避免训练初期震荡)
+        return x_main + 0.2 * x_rect
+
+
+# ==========================================
+# [新增 B] 自适应高频注入 (From BiLIE)
+# 作用：使用拉普拉斯算子提取边缘，防止深层特征平滑化
+# ==========================================
+class AdaptiveHighFreqEnhancement(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        # 固定拉普拉斯卷积核 (边缘检测算子)
+        kernel = torch.tensor([[-1, -1, -1],
+                               [-1, 8, -1],
+                               [-1, -1, -1]], dtype=torch.float32).view(1, 1, 3, 3)
+        # register_buffer 保证 kernel 不会作为参数更新，但会随模型保存
+        self.register_buffer('kernel', kernel)
+
+        # 自适应门控，决定哪些区域需要注入高频信息
+        self.gate = nn.Sequential(
+            nn.Conv2d(dim, dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # 动态适配通道数
+        k = self.kernel.expand(C, 1, 3, 3)
+
+        # 提取高频 (Edges)
+        # padding=1 保持尺寸一致, groups=C 保证逐通道处理
+        high_freq = F.conv2d(x, k, padding=1, groups=C)
+
+        # 自适应注入：只在 Gate 响应高的地方加边缘
+        return x + high_freq * self.gate(x)
+
+
+# ==========================================
+# [新增 C] 可学习形态学层 (Morphological Layer)
+# 作用：修复断裂 (Curve) 和 粘连
+# ==========================================
+class LearnableMorphologicalLayer(nn.Module):
+    def __init__(self, dim, kernel_size=3):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+
+        # 学习形态学操作的权重 (决定是腐蚀还是膨胀，以及强度)
+        self.morph_gate = nn.Sequential(
+            nn.Conv2d(dim, dim, 1),
+            nn.Tanh()  # Tanh 输出 [-1, 1]，允许正负反馈
+        )
+
+    def forward(self, x):
+        # 1. 软膨胀 (Soft Dilation) ≈ MaxPool
+        dilated = F.max_pool2d(x, self.kernel_size, stride=1, padding=self.padding)
+
+        # 2. 软腐蚀 (Soft Erosion) ≈ -MaxPool(-x)
+        eroded = -F.max_pool2d(-x, self.kernel_size, stride=1, padding=self.padding)
+
+        # 3. 形态学梯度 (Morphological Gradient) = 膨胀 - 腐蚀
+        # 这捕捉了物体的骨架和边缘结构
+        skeleton = dilated - eroded
+
+        # 4. 将骨架信息加回原特征
+        return x + skeleton * self.morph_gate(x)
+
+
+# ==========================================
+# 3. [原有] 特征校正模块 (From CMX 论文)
 # ==========================================
 class FeatureRectificationModule(nn.Module):
     def __init__(self, dim):
@@ -80,7 +179,6 @@ class FeatureRectificationModule(nn.Module):
 
 # ==========================================
 # 4. [稳健版] 门控多尺度修补
-# 注意：这里改回了 Sigmoid + LayerNorm，这是防止崩盘和保护护栏的关键
 # ==========================================
 class MultiScaleRefinementBlock(nn.Module):
     def __init__(self, dim):
@@ -102,7 +200,6 @@ class MultiScaleRefinementBlock(nn.Module):
             nn.Conv2d(dim // 4, dim, 1),
             nn.Sigmoid()
         )
-        # 使用 Sigmoid 独立控制，让护栏和减速带共存
         self.gate_conv = nn.Sequential(
             nn.Conv2d(dim * 3, dim // 2, 1),
             nn.ReLU(),
@@ -110,7 +207,7 @@ class MultiScaleRefinementBlock(nn.Module):
             nn.Sigmoid()
         )
         self.proj = nn.Conv2d(dim, dim, 1)
-        self.norm = nn.LayerNorm(dim)  # 核心刹车片
+        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
         identity = x
@@ -127,10 +224,8 @@ class MultiScaleRefinementBlock(nn.Module):
         g_local = gates[:, 0:1, :, :]
         g_context = gates[:, 1:2, :, :]
 
-        # 叠加融合
         out = identity + g_local * feat_local + g_context * feat_context
 
-        # [Norm] 防止梯度爆炸
         out = out.permute(0, 2, 3, 1)
         out = self.norm(out)
         out = out.permute(0, 3, 1, 2)
@@ -143,7 +238,6 @@ class MultiScaleRefinementBlock(nn.Module):
 # 5. 混合差分注意力
 # ==========================================
 class DifferentialCrossAttention(nn.Module):
-    # 保持 Dropout 0.1，这是最佳版本的参数
     def __init__(self, dim, num_heads=4, qkv_bias=True, attn_drop=0.1, proj_drop=0.1, lambda_init=0.8):
         super().__init__()
         assert num_heads % 2 == 0
@@ -247,9 +341,20 @@ class DynamicFusionModule(nn.Module):
         super().__init__()
         self.dim = dim
 
-        # [新增] 模态校正模块 (From CMX)
+        # [修改] 1. 频域校正模块 (Priority A: FreqSal)
+        # 先在频域对齐模态，再做后续处理
+        self.freq_rect_ir = FrequencyRectificationModule(dim)
+        self.freq_rect_vis = FrequencyRectificationModule(dim)
+
+        # [保持] 2. 空间校正模块 (From CMX)
         self.rect_ir = FeatureRectificationModule(dim)
         self.rect_vis = FeatureRectificationModule(dim)
+
+        # [新增] 3. 自适应高频增强 (Priority A: BiLIE)
+        self.high_freq_enhance = AdaptiveHighFreqEnhancement(dim)
+
+        # [新增] 4. 形态学层 (Priority C: Morphological)
+        self.morph_layer = LearnableMorphologicalLayer(dim)
 
         self.init_fusion = nn.Sequential(
             nn.Conv2d(dim * 2, dim, 1),
@@ -269,8 +374,7 @@ class DynamicFusionModule(nn.Module):
         self.aux_head = nn.Conv2d(dim, 9, kernel_size=1)
 
     def forward(self, f_ir, f_vis, gt_entropy=None, gt_entropy_vis=None, gt_entropy_ir=None):
-        # --- [新增] Modality Dropout (From U3M) ---
-        # 仅在训练时启用：10% 概率丢弃 IR，10% 概率丢弃 VIS
+        # --- Modality Dropout (From U3M) ---
         if self.training:
             prob = torch.rand(1).item()
             if prob < 0.1:  # 10% 概率丢弃 IR
@@ -278,12 +382,16 @@ class DynamicFusionModule(nn.Module):
             elif prob < 0.2:  # 10% 概率丢弃 VIS
                 f_vis = torch.zeros_like(f_vis)
 
-        # --- [新增] Feature Rectification (From CMX) ---
-        # 互相校正去噪
+        # --- Step 1: 频域校正 (New) ---
+        # 用 VIS 的纹理补 IR，用 IR 的结构补 VIS
+        f_ir = self.freq_rect_ir(f_ir, f_vis)
+        f_vis = self.freq_rect_vis(f_vis, f_ir)
+
+        # --- Step 2: 空间校正 (Original) ---
         f_ir = self.rect_ir(f_ir, f_vis)
         f_vis = self.rect_vis(f_vis, f_ir)
 
-        # 融合逻辑
+        # --- 融合逻辑 ---
         B, C, H, W = f_ir.shape
         device = f_ir.device
 
@@ -294,7 +402,12 @@ class DynamicFusionModule(nn.Module):
         base_feat_sum = base_feat_sum.permute(0, 3, 1, 2)
 
         if gt_entropy is None:
-            return base_feat_sum, torch.tensor(0.0, device=device), None
+            # 即使没有 Entropy，也要走一遍增强流程
+            # 对 base_feat_sum 做 refine 和增强
+            f_final = self.context_refine(base_feat_sum)
+            f_final = self.high_freq_enhance(f_final)  # 增强边缘
+            f_final = self.morph_layer(f_final)  # 修复断裂
+            return f_final, torch.tensor(0.0, device=device), None
 
         threshold = gt_entropy.mean(dim=(2, 3), keepdim=True)
         selection_mask = (gt_entropy > threshold).float()
@@ -330,7 +443,16 @@ class DynamicFusionModule(nn.Module):
                 final_canvas[b, indices] += weighted_residual.squeeze(0)
 
         f_final = final_canvas.transpose(1, 2).view(B, C, H, W)
+
+        # --- Step 3: 后处理增强 (Refine -> HighFreq -> Morph) ---
         f_final = self.context_refine(f_final)
+
+        # [新增] BiLIE: 注入高频边缘
+        f_final = self.high_freq_enhance(f_final)
+
+        # [新增] Morph: 修复车道线断裂
+        f_final = self.morph_layer(f_final)
+
         aux_logits = self.aux_head(f_final)
 
         return f_final, aux_loss, aux_logits
