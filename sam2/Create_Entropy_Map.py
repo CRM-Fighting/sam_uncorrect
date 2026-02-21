@@ -16,15 +16,16 @@ except ImportError:
 
 # ================= 配置区域 =================
 
-# 1. 数据集根目录
+# 1. 数据集根目录 (绝对路径)
 DATASET_ROOT = Path("/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS")
 
 # 2. 输出目录 (保持和之前一致)
 OUTPUT_ROOT = DATASET_ROOT / "entropy_maps_add"
 
-# 3. 模型权重
-CHECKPOINT = "../checkpoints/sam2.1_hiera_tiny.pt"
-MODEL_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+# 3. 模型权重与配置 【已修改为 Large 版本】
+# 请确保下载了 sam2.1_hiera_large.pt 并放在 ../checkpoints/ 目录下
+CHECKPOINT = "../checkpoints/sam2.1_hiera_large.pt"
+MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 # 4个阶段的下采样倍率
 TOKEN_SIZES = {'stage1': 4, 'stage2': 8, 'stage3': 16, 'stage4': 32}
@@ -34,6 +35,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"Dataset Path: {DATASET_ROOT}")
 print(f"Output Path:  {OUTPUT_ROOT}")
+print(f"Model Config: {MODEL_CFG}")
+print(f"Checkpoint:   {CHECKPOINT}")
 print("-" * 50)
 
 
@@ -79,14 +82,14 @@ def check_data_consistency(subset_name):
     return len(files_vi) > 0  # 简单检查，假设之前已经检查过完整性
 
 
-# ================= 核心处理逻辑 (修改版) =================
+# ================= 核心处理逻辑 (保持不变) =================
 def process_subset(subset_name, mask_generator):
     vis_dir = DATASET_ROOT / subset_name / "vi"
     ir_dir = DATASET_ROOT / subset_name / "ir"
 
     print(f"开始补全数据集: {subset_name} 的 VI 和 IR 熵图")
 
-    # === 修改点：只创建 vi 和 ir 目录，不处理 sum ===
+    # === 只创建 vi 和 ir 目录 ===
     vi_output_dirs = {}
     ir_output_dirs = {}
 
@@ -106,7 +109,7 @@ def process_subset(subset_name, mask_generator):
     for fname in tqdm(files, desc=f"Processing {subset_name}"):
         save_name_npy = Path(fname).stem + ".npy"
 
-        # 断点续传：如果 VI 文件夹里已经有这个文件，说明处理过了 (假设IR也就有了)
+        # 断点续传：如果 VI 文件夹里已经有这个文件，说明处理过了
         if (vi_output_dirs['stage1'] / save_name_npy).exists():
             continue
 
@@ -121,7 +124,7 @@ def process_subset(subset_name, mask_generator):
             img_vis = cv2.resize(img_vis, (IMG_W, IMG_H))
             img_ir = cv2.resize(img_ir, (IMG_W, IMG_H))
 
-            # === 推理 (这是必须的，无法跳过) ===
+            # === 推理 ===
             with torch.no_grad():
                 masks_vis = mask_generator.generate(img_vis)
                 masks_ir = mask_generator.generate(img_ir)
@@ -134,7 +137,7 @@ def process_subset(subset_name, mask_generator):
                 map_vis = create_entropy_map(heatmap_vis, token_size)
                 map_ir = create_entropy_map(heatmap_ir, token_size)
 
-                # 仅保存 VI 和 IR，不再做相加和保存相加图
+                # 仅保存 VI 和 IR
                 np.save(vi_output_dirs[stage_name] / save_name_npy, map_vis)
                 np.save(ir_output_dirs[stage_name] / save_name_npy, map_ir)
 
@@ -153,8 +156,12 @@ if __name__ == "__main__":
     # === 包含所有阶段 ===
     TARGET_SUBSETS = ["train", "val", "test"]
 
-    print(f"正在加载 SAM 2 模型 (Config: {MODEL_CFG})...")
+    print(f"正在加载 SAM 2 Large 模型 (Config: {MODEL_CFG})...")
+    # 注意：build_sam2 会根据 yaml 自动加载对应的结构
     model = build_sam2(str(MODEL_CFG), str(CHECKPOINT), device=DEVICE)
+
+    # 针对 Large 模型，可以适当调整 points_per_side 或 pred_iou_thresh 以优化显存和质量
+    # 这里保持默认，如果你显存不够 (Large 显存占用较高)，可以减少 points_per_side
     mask_generator = SAM2AutomaticMaskGenerator(model)
 
     for subset in TARGET_SUBSETS:

@@ -174,8 +174,8 @@ def test():
 
     # 1. Build Model
     print(f"🚀 Loading model from {CKPT_PATH}...")
-    SAM_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
-    SAM_CKPT = "../checkpoints/sam2.1_hiera_tiny.pt"  # 仅用于初始化结构
+    SAM_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    SAM_CKPT = "../checkpoints/sam2.1_hiera_large.pt"  # 仅用于初始化结构
 
     base = build_sam2(SAM_CFG, SAM_CKPT, device="cpu")
     model = MultiTaskSerialModel(base, GlobalGuidedAoEBlock, num_classes=NUM_CLASSES)

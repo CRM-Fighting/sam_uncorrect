@@ -34,7 +34,7 @@ from utils.custom_losses import BinarySUMLoss, StandardSegLoss
 # ==============================================================================
 # 配置区域
 # ==============================================================================
-EXP_NAME = "2月6日17点权重"
+EXP_NAME = "2月19日权重"  # 建议修改名字以区分实验
 EXP_ROOT = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/checkpoints/"
 
 # 路径配置
@@ -51,9 +51,11 @@ VAL_DIRS = {
 }
 UNCERTAINTY_ROOT_TRAIN = "/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/uncertainty_map/train"
 
-SAM_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
-SAM_CKPT = "../checkpoints/sam2.1_hiera_tiny.pt"
+# 【修改】指向 SAM 2 Large 的配置和权重
+SAM_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+SAM_CKPT = "../checkpoints/sam2.1_hiera_large.pt"
 
+# 【注意】Large 模型显存占用极大，BATCH_SIZE=1 配合 ACCUM_STEPS 可能是必须的
 BATCH_SIZE = 1
 ACCUM_STEPS = 16
 EPOCHS = 200
@@ -317,6 +319,7 @@ def train():
     setup_seed(42)
     exp_dirs = setup_experiment()
 
+    # Configs 已经更新为 Large
     base = build_sam2(SAM_CFG, SAM_CKPT, device="cpu")
     model = MultiTaskSerialModel(base, GlobalGuidedAoEBlock, num_classes=NUM_CLASSES).cuda()
 
@@ -336,7 +339,7 @@ def train():
     opt = optim.AdamW([
         {'params': high_lr_params, 'lr': base_lr_low * 2.0},
         {'params': low_lr_params, 'lr': base_lr_low}
-    ], weight_decay=0.02)  # 建议这里也可以稍微改大一点到 0.05，不过先保持不动也行
+    ], weight_decay=0.02)
 
     train_dataset = MSRSDataset(TRAIN_DIRS, UNCERTAINTY_ROOT_TRAIN, ENTROPY_ROOT, is_train=True)
     steps_per_epoch = len(DataLoader(train_dataset, batch_size=BATCH_SIZE)) // ACCUM_STEPS
@@ -386,7 +389,6 @@ def train():
                 train_e_ir = e_ir
 
             with autocast():
-                # 接收 pred_edge
                 seg_out, sam_preds, moe_loss, fusion_loss, aux_logits, pred_edge = model(
                     vis=v, ir=i_img, gt_semantic=l,
                     gt_entropy_maps=train_e_sum,
@@ -404,8 +406,6 @@ def train():
                 else:
                     loss_fusion_aux = torch.tensor(0.0).cuda()
 
-                # 【重点修改】降低辅助Loss权重，突出主任务
-                # 0.5 -> 0.2
                 loss = l_main + 0.2 * l_aux + 0.2 * fusion_loss + 0.02 * moe_loss + 0.2 * loss_fusion_aux
                 loss = loss / ACCUM_STEPS
 

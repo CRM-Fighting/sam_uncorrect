@@ -9,20 +9,29 @@ class MultiTaskSerialModel(SerialSegModel):
     def __init__(self, base_sam, moe_class, num_classes=9):
         super().__init__(base_sam, moe_class, num_classes)
 
-        channels = [96, 192, 384, 768]
+        # =========================================================
+        # 【修改】适配 SAM 2 Large (Hiera-L) 的特征维度
+        # Hiera-Tiny:  [96, 192, 384, 768]
+        # Hiera-Large: [144, 288, 576, 1152]
+        # =========================================================
+        self.channels = [144, 288, 576, 1152]
 
         # 【修改】去掉 Stage 1 的 Fusion Layer，只保留后 3 个
+        # 对应 channels[1:] -> [288, 576, 1152]
         self.fusion_layers = nn.ModuleList([
-            DynamicFusionModule(dim=ch) for ch in channels[1:]
+            DynamicFusionModule(dim=ch) for ch in self.channels[1:]
         ])
 
+        # 冻结 SAM 提示编码器和掩码解码器
         for param in self.backbone.base_sam.sam_prompt_encoder.parameters():
             param.requires_grad = False
         for param in self.backbone.base_sam.sam_mask_decoder.parameters():
             param.requires_grad = False
 
         self.backbone.base_sam.sam_mask_decoder.use_high_res_features = False
-        self.sam_proj_s4 = nn.Conv2d(768, 256, kernel_size=1)
+
+        # 【修改】SAM Head 投影层输入维度适配 Large (Stage 4 = 1152)
+        self.sam_proj_s4 = nn.Conv2d(1152, 256, kernel_size=1)
 
     def get_prompt(self, gt):
         B, H, W = gt.shape
@@ -74,7 +83,7 @@ class MultiTaskSerialModel(SerialSegModel):
         final_aux_logits = None
 
         # 【修改】Stage 1 (High Res) 直接拼接 (Early Concat)
-        # 此时 c1_fused 维度为 96 + 96 = 192
+        # Large: 144 + 144 = 288
         c1_fused = torch.cat([feats_rgb[0], feats_ir[0]], dim=1)
         fused.append(c1_fused)
 
@@ -96,7 +105,7 @@ class MultiTaskSerialModel(SerialSegModel):
             total_fusion_loss += f_loss
             if i == 2: final_aux_logits = aux_logit
 
-        # 【修改】Detail Feat 使用双模态拼接特征，供边缘提取
+        # 【修改】Detail Feat 使用双模态拼接特征
         detail_feat_combined = torch.cat([feats_rgb[0], feats_ir[0]], dim=1)
 
         ret = self.segformer_head(fused, detail_feat=detail_feat_combined)

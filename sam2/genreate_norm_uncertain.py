@@ -42,7 +42,7 @@ def generate_ci_map_and_stats(masks, image_shape):
     for mask_data in masks:
         overlay_count[mask_data['segmentation']] += 1.0
 
-    # 2. 获取最大堆叠数 (这是你要打印的指标)
+    # 2. 获取最大堆叠数
     max_stack = np.max(overlay_count)
 
     # 3. 归一化
@@ -84,7 +84,6 @@ def process_paired_data(vis_dir, ir_dir, output_root, mask_generator):
 
         # --- 1. 检查文件是否存在 ---
         if not f_ir.exists():
-            # 打印：红外——图片名——未找到
             msg = f"红外——{fname}——未找到"
             if HAS_TQDM:
                 tqdm.write(msg)
@@ -96,9 +95,8 @@ def process_paired_data(vis_dir, ir_dir, output_root, mask_generator):
         img_vis = cv2.imread(str(f_vis))
         img_ir = cv2.imread(str(f_ir))
 
-        # 检查读取是否成功
         if img_vis is None:
-            msg = f"可见光——{fname}——未找到"  # 或无法读取
+            msg = f"可见光——{fname}——未找到"
             if HAS_TQDM:
                 tqdm.write(msg)
             else:
@@ -106,7 +104,7 @@ def process_paired_data(vis_dir, ir_dir, output_root, mask_generator):
             continue
 
         if img_ir is None:
-            msg = f"红外——{fname}——未找到"  # 或无法读取
+            msg = f"红外——{fname}——未找到"
             if HAS_TQDM:
                 tqdm.write(msg)
             else:
@@ -115,6 +113,7 @@ def process_paired_data(vis_dir, ir_dir, output_root, mask_generator):
 
         try:
             # --- 3. 处理红外 (IR) ---
+            # 这里的 mask_generator 已经是 Large 版本了
             masks_ir = mask_generator.generate(img_ir)
             ci_map_ir, max_stack_ir = generate_ci_map_and_stats(masks_ir, img_ir.shape)
 
@@ -128,9 +127,7 @@ def process_paired_data(vis_dir, ir_dir, output_root, mask_generator):
             np.save(str(out_vis_path / save_name), ci_map_vis)
 
             # --- 6. 打印指定格式 ---
-            # 格式：图片名—红外：最大数目-可见光：最大数目
-            # 使用 int() 去掉小数点，看起来更整洁
-            stats_msg = f"{fname}—红外：{max_stack_ir}-可见光：{max_stack_vis}"
+            stats_msg = f"{fname}—红外：{int(max_stack_ir)}-可见光：{int(max_stack_vis)}"
 
             if HAS_TQDM:
                 tqdm.write(stats_msg)
@@ -146,25 +143,34 @@ def process_paired_data(vis_dir, ir_dir, output_root, mask_generator):
 
 
 if __name__ == "__main__":
-    # --- 1. 路径配置 ---
+    # --- 1. 路径配置 (绝对路径) ---
     DATASET_ROOT = Path("/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS")
     OUTPUT_ROOT = Path("/home/mmsys/disk/MCL/MultiModal_Project/sam2/data/MSRS/uncertainty_map")
 
     train_vi_dir = DATASET_ROOT / "train/vi"
     train_ir_dir = DATASET_ROOT / "train/ir"
 
-    # --- 2. 加载 SAM2 模型 ---
-    checkpoint = "../checkpoints/sam2.1_hiera_tiny.pt"
-    model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+    # --- 2. 加载 SAM2 Large 模型 【已修改】 ---
+    # 权重路径：确保你有这个文件，通常 Large 版本的权重名为 sam2.1_hiera_large.pt
+    checkpoint = "../checkpoints/sam2.1_hiera_large.pt"
+    # Config路径：使用 hiera_l (Large)
+    model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"正在加载 SAM2 模型到 {device} ...")
+    print(f"正在加载 SAM2 Large 模型到 {device} ...")
+    print(f"配置文件: {model_cfg}")
+    print(f"权重文件: {checkpoint}")
+
     try:
         model = build_sam2(model_cfg, checkpoint, device=device)
+        # 初始化 Mask Generator，参数可按需调整
         mask_generator = SAM2AutomaticMaskGenerator(model)
-        print("模型加载成功。")
+        print("Large 模型加载成功。")
     except Exception as e:
         print(f"模型加载失败: {e}")
+        print(
+            "请检查：\n1. checkpoints 目录下是否有 sam2.1_hiera_large.pt\n2. configs/sam2.1/ 下是否有 sam2.1_hiera_l.yaml")
         exit()
 
     # --- 3. 执行成对处理 (只处理训练集) ---
